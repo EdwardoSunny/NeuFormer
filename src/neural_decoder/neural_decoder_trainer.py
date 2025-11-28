@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
+import wandb
 
 from .model import GRUDecoder
 from .dataset import SpeechDataset
@@ -64,6 +65,13 @@ def trainModel(args):
     with open(args["outputDir"] + "/args", "wb") as file:
         pickle.dump(args, file)
 
+    # Initialize wandb
+    wandb.init(
+        project="neural-seq-decoder",
+        config=args,
+        name=os.path.basename(args["outputDir"]),
+    )
+
     trainLoader, testLoader, loadedData = getDatasetLoaders(
         args["datasetPath"],
         args["batchSize"],
@@ -82,6 +90,9 @@ def trainModel(args):
         gaussianSmoothWidth=args["gaussianSmoothWidth"],
         bidirectional=args["bidirectional"],
     ).to(device)
+
+    # Watch model with wandb
+    wandb.watch(model, log="all", log_freq=100)
 
     loss_ctc = torch.nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
     optimizer = torch.optim.Adam(
@@ -141,7 +152,12 @@ def trainModel(args):
         optimizer.step()
         scheduler.step()
 
-        # print(endTime - startTime)
+        # Log training metrics
+        wandb.log({
+            "train/loss": loss.item(),
+            "train/learning_rate": optimizer.param_groups[0]['lr'],
+            "train/batch": batch,
+        }, step=batch)
 
         # Eval
         if batch % 100 == 0:
@@ -195,13 +211,24 @@ def trainModel(args):
                 cer = total_edit_distance / total_seq_length
 
                 endTime = time.time()
+                time_per_batch = (endTime - startTime) / 100
+
                 print(
-                    f"batch {batch}, ctc loss: {avgDayLoss:>7f}, cer: {cer:>7f}, time/batch: {(endTime - startTime)/100:>7.3f}"
+                    f"batch {batch}, ctc loss: {avgDayLoss:>7f}, cer: {cer:>7f}, time/batch: {time_per_batch:>7.3f}"
                 )
+
+                # Log evaluation metrics
+                wandb.log({
+                    "eval/loss": avgDayLoss,
+                    "eval/cer": cer,
+                    "eval/time_per_batch": time_per_batch,
+                }, step=batch)
+
                 startTime = time.time()
 
             if len(testCER) > 0 and cer < np.min(testCER):
                 torch.save(model.state_dict(), args["outputDir"] + "/modelWeights")
+                wandb.log({"eval/best_cer": cer}, step=batch)
             testLoss.append(avgDayLoss)
             testCER.append(cer)
 
@@ -211,6 +238,9 @@ def trainModel(args):
 
             with open(args["outputDir"] + "/trainingStats", "wb") as file:
                 pickle.dump(tStats, file)
+
+    # Finish wandb run
+    wandb.finish()
 
 
 def loadModel(modelDir, nInputLayers=24, device="cuda"):
