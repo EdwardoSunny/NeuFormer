@@ -774,14 +774,14 @@ class MultiScaleConformerEncoder(nn.Module):
         # Positional encoding
         self.pos_enc = RelativePositionalEncoding(d_model)
 
-    def forward(self, x: torch.Tensor, padding_mask: Optional[torch.Tensor] = None, return_scales: bool = False):
+    def forward(self, x: torch.Tensor, padding_mask: Optional[torch.Tensor] = None, return_all_scales: bool = False):
         """
         x: [B, T, C] - neural signal
-        return_scales: if True, return individual scales for adaptive fusion
+        return_all_scales: if True, return individual scales AND fused (for multi-scale CTC)
 
         Returns:
-            if return_scales=False: [B, T', D] - fused features
-            if return_scales=True: (fast, medium, slow) - individual scale features
+            if return_all_scales=False: [B, T', D] - fused features only
+            if return_all_scales=True: dict with 'fast', 'medium', 'slow', 'fused'
         """
         # x: [B, T, C] -> transpose for conv1d
         x_t = x.transpose(1, 2)  # [B, C, T]
@@ -804,12 +804,18 @@ class MultiScaleConformerEncoder(nn.Module):
         for layer in self.slow_conformer:
             slow = layer(slow, src_key_padding_mask=None)
 
-        # Return individual scales or fused
-        if return_scales:
-            return fast, medium, slow
+        # Fuse across scales
+        fused = self.fusion(fast, medium, slow)  # [B, T/4, D]
+
+        # Return based on flag
+        if return_all_scales:
+            return {
+                'fast': fast,      # [B, ~75, D]
+                'medium': medium,  # [B, ~38, D]
+                'slow': slow,      # [B, ~19, D]
+                'fused': fused,    # [B, ~38, D]
+            }
         else:
-            # Fuse across scales
-            fused = self.fusion(fast, medium, slow)  # [B, T/4, D]
             return fused
 
 
@@ -1055,6 +1061,8 @@ class MultiScaleCTCDecoder(nn.Module):
         use_contrastive_pretraining: bool = False,
         use_diphone_head: bool = False,
         num_diphones: int = 1012,  # Default from vocab (1011 + blank)
+        diphone_marginalization_matrix: Optional[np.ndarray] = None,  # For proper DCoND
+        use_multiscale_ctc: bool = False,  # NEW: Enable Step 3 multi-scale CTC heads
         device: str = "cuda",
     ):
         super().__init__()
@@ -1063,7 +1071,17 @@ class MultiScaleCTCDecoder(nn.Module):
         self.use_contrastive_pretraining = use_contrastive_pretraining
         self.use_diphone_head = use_diphone_head
         self.num_diphones = num_diphones
+        self.use_multiscale_ctc = use_multiscale_ctc
         self.device = device
+
+        # Check if we're using proper marginalization (DCoND approach)
+        self.use_marginalization = diphone_marginalization_matrix is not None
+        if self.use_marginalization:
+            # Register marginalization matrix as a buffer (not a parameter)
+            marg_matrix_tensor = torch.from_numpy(diphone_marginalization_matrix).float()
+            self.register_buffer('marginalization_matrix', marg_matrix_tensor)
+            print(f"✓ Using proper DCoND marginalization: diphone -> phoneme")
+            print(f"  Marginalization matrix shape: {marg_matrix_tensor.shape}")
 
         # Gaussian smoothing (optional, match GRU baseline)
         self.gaussian_smooth_width = gaussian_smooth_width
@@ -1094,13 +1112,32 @@ class MultiScaleCTCDecoder(nn.Module):
         )
 
         # CTC output layers
-        self.phone_output = nn.Linear(d_model, n_classes)  # Phoneme head
-
-        # Diphone auxiliary head (optional, for context-aware learning)
-        if use_diphone_head:
+        if self.use_marginalization:
+            # PROPER DCoND: Only diphone head, marginalize to get phoneme predictions
             self.diphone_output = nn.Linear(d_model, num_diphones)
+            self.phone_output = None  # Not needed - phonemes come from marginalization
+            print(f"  Model architecture: diphone_output only (phonemes via marginalization)")
+        elif use_diphone_head:
+            # OLD APPROACH: Separate heads (for backward compatibility)
+            self.phone_output = nn.Linear(d_model, n_classes)
+            self.diphone_output = nn.Linear(d_model, num_diphones)
+            print(f"  Model architecture: separate phone_output and diphone_output heads")
         else:
+            # BASELINE: Only phoneme head
+            self.phone_output = nn.Linear(d_model, n_classes)
             self.diphone_output = None
+            print(f"  Model architecture: phone_output only (baseline)")
+
+        # STEP 3: Multi-scale auxiliary CTC heads (optional)
+        if use_multiscale_ctc:
+            # Lightweight auxiliary phoneme heads for fast and slow pathways
+            # These provide additional supervision and improve gradient flow
+            self.fast_phone_head = nn.Linear(d_model, n_classes)
+            self.slow_phone_head = nn.Linear(d_model, n_classes)
+            print(f"  + Multi-scale CTC: auxiliary heads on fast and slow pathways")
+        else:
+            self.fast_phone_head = None
+            self.slow_phone_head = None
 
         # Contrastive pre-training module (optional)
         if use_contrastive_pretraining:
@@ -1144,25 +1181,85 @@ class MultiScaleCTCDecoder(nn.Module):
         x = torch.cat(x_normalized, dim=0)
 
         # Encode with multi-scale encoder
-        encoder_output = self.encoder(x)  # [B, T', D] where T' = T/4 (medium scale)
+        if self.use_multiscale_ctc:
+            # Get all scales for multi-scale CTC
+            encoder_scales = self.encoder(x, return_all_scales=True)
+            fast_output = encoder_scales['fast']      # [B, T_fast, D] ~75 timesteps (stride 2)
+            encoder_output = encoder_scales['fused']  # [B, T_medium, D] ~38 timesteps (stride 4) - main
+            slow_output = encoder_scales['slow']      # [B, T_slow, D] ~19 timesteps (stride 8)
+        else:
+            # Only get fused medium scale
+            encoder_output = self.encoder(x)  # [B, T', D] where T' = T/4 (medium scale)
 
         # Contrastive pre-training mode
         if return_contrastive_loss and self.use_contrastive_pretraining:
             return self.contrastive_module(x)
 
-        # Phoneme CTC output
-        phone_logits = self.phone_output(encoder_output)  # [B, T', n_classes]
-        phone_log_probs = phone_logits.log_softmax(dim=-1).transpose(0, 1)  # [T', B, n_classes]
-
-        # Compute output lengths (medium pathway has stride 4)
+        # Compute output lengths for each scale
         out_lengths = torch.full((x.shape[0],), encoder_output.shape[1], dtype=torch.long, device=x.device)
 
-        # Diphone CTC output (if enabled)
-        if self.use_diphone_head:
+        if self.use_multiscale_ctc:
+            fast_out_lengths = torch.full((x.shape[0],), fast_output.shape[1], dtype=torch.long, device=x.device)
+            slow_out_lengths = torch.full((x.shape[0],), slow_output.shape[1], dtype=torch.long, device=x.device)
+
+        if self.use_marginalization:
+            # PROPER DCoND APPROACH: Predict diphones, marginalize to get phonemes
+            # Step 1: Predict diphone logits
+            diphone_logits = self.diphone_output(encoder_output)  # [B, T', num_diphones]
+            diphone_log_probs = diphone_logits.log_softmax(dim=-1)  # [B, T', num_diphones]
+
+            # Step 2: Marginalize to get phoneme log probabilities
+            # P(phoneme_j | x) = sum_i P(diphone_ij | x)
+            # In log space: log P(phoneme_j) = logsumexp over diphones ending in j
+            # But we can use matrix multiplication in probability space for simplicity
+            diphone_probs = torch.exp(diphone_log_probs)  # [B, T', num_diphones]
+
+            # Matrix multiply: [B, T', num_diphones] @ [num_diphones, n_classes] -> [B, T', n_classes]
+            phone_probs = torch.matmul(diphone_probs, self.marginalization_matrix)  # [B, T', n_classes]
+
+            # Convert back to log probabilities (add small epsilon for numerical stability)
+            phone_log_probs = torch.log(phone_probs + 1e-10)  # [B, T', n_classes]
+            phone_log_probs = phone_log_probs.transpose(0, 1)  # [T', B, n_classes]
+
+            # Also return diphone log probs for joint loss
+            diphone_log_probs_transposed = diphone_log_probs.transpose(0, 1)  # [T', B, num_diphones]
+
+            # STEP 3: Compute auxiliary CTC outputs from fast and slow scales
+            if self.use_multiscale_ctc:
+                # Fast pathway auxiliary phoneme head
+                fast_phone_logits = self.fast_phone_head(fast_output)  # [B, T_fast, n_classes]
+                fast_phone_log_probs = fast_phone_logits.log_softmax(dim=-1).transpose(0, 1)  # [T_fast, B, n_classes]
+
+                # Slow pathway auxiliary phoneme head
+                slow_phone_logits = self.slow_phone_head(slow_output)  # [B, T_slow, n_classes]
+                slow_phone_log_probs = slow_phone_logits.log_softmax(dim=-1).transpose(0, 1)  # [T_slow, B, n_classes]
+
+                # Return: main phone, main lengths, main diphone, fast phone, fast lengths, slow phone, slow lengths
+                return (
+                    phone_log_probs,              # Main phoneme predictions (fused, from diphone marginalization)
+                    out_lengths,                   # Main output lengths
+                    diphone_log_probs_transposed, # Main diphone predictions
+                    fast_phone_log_probs,         # Fast pathway auxiliary phoneme predictions
+                    fast_out_lengths,             # Fast pathway output lengths
+                    slow_phone_log_probs,         # Slow pathway auxiliary phoneme predictions
+                    slow_out_lengths,             # Slow pathway output lengths
+                )
+            else:
+                return phone_log_probs, out_lengths, diphone_log_probs_transposed
+
+        elif self.use_diphone_head:
+            # OLD APPROACH: Separate independent heads
+            phone_logits = self.phone_output(encoder_output)  # [B, T', n_classes]
+            phone_log_probs = phone_logits.log_softmax(dim=-1).transpose(0, 1)  # [T', B, n_classes]
+
             diphone_logits = self.diphone_output(encoder_output)  # [B, T', num_diphones]
             diphone_log_probs = diphone_logits.log_softmax(dim=-1).transpose(0, 1)  # [T', B, num_diphones]
             return phone_log_probs, out_lengths, diphone_log_probs
+
         else:
+            # BASELINE: Only phoneme prediction
+            phone_logits = self.phone_output(encoder_output)  # [B, T', n_classes]
+            phone_log_probs = phone_logits.log_softmax(dim=-1).transpose(0, 1)  # [T', B, n_classes]
             return phone_log_probs, out_lengths
 
 

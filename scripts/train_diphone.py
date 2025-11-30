@@ -52,16 +52,57 @@ args['label_smoothing'] = 0.1
 args['time_mask_param'] = 15  # Less aggressive (was 20)
 
 # ===========================================================================
-# DIPHONE AUXILIARY HEAD CONFIGURATION (NEW!)
+# DIPHONE WITH MARGINALIZATION (PROPER DCoND STEP 2)
 # ===========================================================================
-args['use_diphone_head'] = True  # Enable diphone auxiliary head
+args['use_diphone_head'] = True  # Enable diphone head
 args['diphone_vocab_path'] = '/home/edward/neural_seq_decoder/diphone_vocab.pkl'
-args['diphone_alpha_schedule'] = 'constant'  # Options: 'constant' or 'scheduled'
-# With 'constant': 50/50 weighting between phoneme and diphone loss
-# With 'scheduled': Paper-style schedule (start with diphones, end with phonemes)
+args['use_diphone_marginalization'] = True  # Enable proper marginalization!
 
-# Note: Diphone head adds ~1M parameters (1024 -> 1012 diphones)
-# Total model: ~242M parameters (241M base + 1M diphone head)
+# DCoND Step 2 - Joint Loss Architecture:
+#   - Model has ONLY diphone_output head (no phone_output)
+#   - Phoneme probs: P(phoneme_j) = sum_i P(diphone_ij) via marginalization
+#   - JOINT CTC LOSS: loss = α * phone_loss + (1-α) * diphone_loss
+#     * phone_loss: CTC on marginalized phoneme distribution
+#     * diphone_loss: CTC on primary diphone distribution
+#     * Both losses backprop through same diphone_head → stronger gradient signal!
+#   - Decoding: Use marginalized phoneme probs (same as before)
+
+# Alpha scheduling (controls phone vs diphone loss weighting):
+args['diphone_alpha_schedule'] = 'constant'  # Options: 'constant' or 'scheduled'
+# - 'constant': α = 0.5 throughout (50/50 weighting)
+# - 'scheduled': Start with more diphone focus, end with more phone focus
+#   * First 20%: α = 0.3 (lean on diphones for context)
+#   * Middle 60%: α ramps 0.3 → 0.7
+#   * Last 20%: α = 0.8 (focus on phonemes)
+
+# Benefits of joint loss over single phoneme loss:
+#   1. Diphone CTC provides direct supervision on diphone predictions
+#   2. Phoneme CTC ensures marginalized predictions match targets
+
+# ===========================================================================
+# MULTI-SCALE CTC HEADS (DCoND STEP 3)
+# ===========================================================================
+args['use_multiscale_ctc'] = True  # Enable Step 3: auxiliary CTC heads on fast/slow pathways
+
+# Lambda weights for auxiliary losses:
+#   total_loss = main_loss + λ_fast * fast_loss + λ_slow * slow_loss
+args['multiscale_lambda_fast'] = 0.3  # Weight for fast pathway (stride 2, ~75 timesteps)
+args['multiscale_lambda_slow'] = 0.3  # Weight for slow pathway (stride 8, ~19 timesteps)
+
+# Benefits of multi-scale CTC (Step 3):
+#   1. Direct supervision at each temporal scale (fast, medium, slow)
+#   2. Stronger gradient flow to all encoder layers
+#   3. Fast pathway learns fine-grained temporal patterns
+#   4. Slow pathway learns long-range context
+#   5. Improved training stability and faster convergence
+#   6. Expected to improve CER by additional 10-20% beyond Step 2
+
+# Without marginalization (OLD baseline, for comparison):
+#   - Set use_diphone_marginalization = False
+#   - Model has separate phone_output and diphone_output heads
+#   - Two independent predictions (diphone doesn't help phoneme)
+
+# Note: Model has ~241M parameters (no separate phoneme head needed!)
 
 from neural_decoder.neural_decoder_trainer import trainModel
 

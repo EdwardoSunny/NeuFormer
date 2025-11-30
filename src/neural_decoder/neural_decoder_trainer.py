@@ -134,11 +134,23 @@ def trainModel(args):
 
     # Load diphone vocabulary if diphone training is enabled
     diphone_vocab = None
+    diphone_marginalization_matrix = None
     if args.get("use_diphone_head", False):
         from neural_decoder.diphone_utils import DiphoneVocabulary
         diphone_vocab_path = args.get("diphone_vocab_path", "/home/edward/neural_seq_decoder/diphone_vocab.pkl")
         print(f"Loading diphone vocabulary from {diphone_vocab_path}")
         diphone_vocab = DiphoneVocabulary.load(diphone_vocab_path)
+
+        # Create marginalization matrix for proper DCoND implementation
+        if args.get("use_diphone_marginalization", True):  # Default to True for new approach
+            print("Creating marginalization matrix for DCoND...")
+            phoneme_blank_id = args["nClasses"]  # Blank is the last class index
+            diphone_marginalization_matrix = diphone_vocab.create_marginalization_matrix(
+                num_phonemes=args["nClasses"] + 1,  # +1 for blank
+                phoneme_blank_id=phoneme_blank_id
+            )
+            print(f"Marginalization matrix shape: {diphone_marginalization_matrix.shape}")
+            print("✓ Will use proper DCoND approach (diphone -> phoneme marginalization)")
 
     trainLoader, testLoader, loadedData = getDatasetLoaders(
         args["datasetPath"],
@@ -181,6 +193,8 @@ def trainModel(args):
             use_contrastive_pretraining=args.get("use_contrastive_pretraining", False),
             use_diphone_head=args.get("use_diphone_head", False),
             num_diphones=diphone_vocab.get_vocab_size() if diphone_vocab is not None else 1012,
+            diphone_marginalization_matrix=diphone_marginalization_matrix,  # Step 1+2: Pass marginalization matrix
+            use_multiscale_ctc=args.get("use_multiscale_ctc", False),  # Step 3: Enable multi-scale CTC heads
             device=device,
         ).to(device)
     elif args.get("model_type", "gru_baseline") == "transformer_ctc":
@@ -364,74 +378,199 @@ def trainModel(args):
                 # Regular CTC training (with optional diphone auxiliary head)
                 model_output = model(X, dayIdx, X_len)
 
-                # Check if model returned diphone outputs
-                if len(model_output) == 3:
+                # Check if model returned multi-scale outputs (Step 3)
+                if len(model_output) == 7:
+                    phone_log_probs, out_lens, diphone_log_probs, fast_phone_log_probs, fast_out_lens, slow_phone_log_probs, slow_out_lens = model_output
+                    has_diphone = True
+                    has_multiscale = True
+                elif len(model_output) == 3:
                     phone_log_probs, out_lens, diphone_log_probs = model_output
                     has_diphone = True
+                    has_multiscale = False
                 else:
                     phone_log_probs, out_lens = model_output
                     has_diphone = False
+                    has_multiscale = False
 
-                # Phoneme CTC loss
-                phone_loss = loss_ctc(
-                    phone_log_probs,
-                    y,
-                    out_lens,
-                    y_len,
-                )
+                # Check if we're using marginalization (proper DCoND)
+                using_marginalization = model.use_marginalization if hasattr(model, 'use_marginalization') else False
 
-                # Apply label smoothing to phoneme loss if enabled
-                if label_smoothing > 0:
-                    phone_ctc_loss = torch.mean(phone_loss)
-                    uniform_dist = torch.full_like(phone_log_probs, -math.log(n_classes))
-                    kl_div = F.kl_div(phone_log_probs, uniform_dist, reduction='batchmean', log_target=True)
-                    phone_loss = (1 - label_smoothing) * phone_ctc_loss + label_smoothing * kl_div
-                else:
-                    phone_loss = torch.sum(phone_loss)
+                if using_marginalization:
+                    # PROPER DCoND (Step 2): Joint CTC loss on BOTH phonemes and diphones
+                    # phone_log_probs come from marginalized diphones
+                    # Both losses backprop through diphone_head → encoder
 
-                # Diphone CTC loss (if enabled)
-                if has_diphone and y_diphone is not None:
-                    # Create CTC loss for diphones (different blank token)
-                    diphone_blank_idx = diphone_vocab.blank_id
-                    if label_smoothing > 0:
-                        loss_ctc_diphone = torch.nn.CTCLoss(blank=diphone_blank_idx, reduction="none", zero_infinity=True)
-                    else:
-                        loss_ctc_diphone = torch.nn.CTCLoss(blank=diphone_blank_idx, reduction="mean", zero_infinity=True)
-
-                    diphone_loss = loss_ctc_diphone(
-                        diphone_log_probs,
-                        y_diphone,
+                    # Phoneme CTC loss (on marginalized phoneme distribution)
+                    phone_loss = loss_ctc(
+                        phone_log_probs,
+                        y,
                         out_lens,
-                        y_diphone_len,
+                        y_len,
                     )
 
-                    # Apply label smoothing to diphone loss if enabled
+                    # Apply label smoothing if enabled
                     if label_smoothing > 0:
-                        diphone_ctc_loss = torch.mean(diphone_loss)
-                        uniform_dist = torch.full_like(diphone_log_probs, -math.log(diphone_vocab.get_vocab_size()))
-                        kl_div = F.kl_div(diphone_log_probs, uniform_dist, reduction='batchmean', log_target=True)
-                        diphone_loss = (1 - label_smoothing) * diphone_ctc_loss + label_smoothing * kl_div
+                        phone_ctc_loss = torch.mean(phone_loss)
+                        uniform_dist = torch.full_like(phone_log_probs, -math.log(n_classes))
+                        kl_div = F.kl_div(phone_log_probs, uniform_dist, reduction='batchmean', log_target=True)
+                        phone_loss = (1 - label_smoothing) * phone_ctc_loss + label_smoothing * kl_div
                     else:
-                        diphone_loss = torch.sum(diphone_loss)
+                        phone_loss = torch.sum(phone_loss)
 
-                    # Joint loss with alpha weighting
-                    alpha = _get_diphone_alpha(
-                        batch,
-                        args["nBatch"],
-                        schedule=args.get("diphone_alpha_schedule", "constant")
-                    )
-                    loss = alpha * phone_loss + (1.0 - alpha) * diphone_loss
+                    # Diphone CTC loss (on primary diphone distribution)
+                    if has_diphone and y_diphone is not None:
+                        diphone_blank_idx = diphone_vocab.blank_id
+                        if label_smoothing > 0:
+                            loss_ctc_diphone = torch.nn.CTCLoss(blank=diphone_blank_idx, reduction="none", zero_infinity=True)
+                        else:
+                            loss_ctc_diphone = torch.nn.CTCLoss(blank=diphone_blank_idx, reduction="mean", zero_infinity=True)
 
-                    # Log individual losses for monitoring
-                    if batch % 100 == 0:
-                        wandb.log({
-                            "train/phone_loss": phone_loss.item(),
-                            "train/diphone_loss": diphone_loss.item(),
-                            "train/alpha": alpha,
-                        })
+                        diphone_loss = loss_ctc_diphone(
+                            diphone_log_probs,
+                            y_diphone,
+                            out_lens,
+                            y_diphone_len,
+                        )
+
+                        # Apply label smoothing to diphone loss if enabled
+                        if label_smoothing > 0:
+                            diphone_ctc_loss = torch.mean(diphone_loss)
+                            uniform_dist = torch.full_like(diphone_log_probs, -math.log(diphone_vocab.get_vocab_size()))
+                            kl_div = F.kl_div(diphone_log_probs, uniform_dist, reduction='batchmean', log_target=True)
+                            diphone_loss = (1 - label_smoothing) * diphone_ctc_loss + label_smoothing * kl_div
+                        else:
+                            diphone_loss = torch.sum(diphone_loss)
+
+                        # JOINT LOSS with alpha weighting (proper DCoND Step 2!)
+                        # Both losses provide gradient signal to the same diphone_head
+                        alpha = _get_diphone_alpha(
+                            batch,
+                            args["nBatch"],
+                            schedule=args.get("diphone_alpha_schedule", "constant")
+                        )
+                        loss = alpha * phone_loss + (1.0 - alpha) * diphone_loss
+
+                        # STEP 3: Add multi-scale auxiliary losses if enabled
+                        if has_multiscale:
+                            # Auxiliary CTC loss on fast pathway (high temporal resolution)
+                            fast_phone_loss = loss_ctc(
+                                fast_phone_log_probs,
+                                y,
+                                fast_out_lens,
+                                y_len,
+                            )
+                            if label_smoothing > 0:
+                                fast_ctc_loss = torch.mean(fast_phone_loss)
+                                uniform_dist = torch.full_like(fast_phone_log_probs, -math.log(n_classes))
+                                kl_div = F.kl_div(fast_phone_log_probs, uniform_dist, reduction='batchmean', log_target=True)
+                                fast_phone_loss = (1 - label_smoothing) * fast_ctc_loss + label_smoothing * kl_div
+                            else:
+                                fast_phone_loss = torch.sum(fast_phone_loss)
+
+                            # Auxiliary CTC loss on slow pathway (low temporal resolution)
+                            slow_phone_loss = loss_ctc(
+                                slow_phone_log_probs,
+                                y,
+                                slow_out_lens,
+                                y_len,
+                            )
+                            if label_smoothing > 0:
+                                slow_ctc_loss = torch.mean(slow_phone_loss)
+                                uniform_dist = torch.full_like(slow_phone_log_probs, -math.log(n_classes))
+                                kl_div = F.kl_div(slow_phone_log_probs, uniform_dist, reduction='batchmean', log_target=True)
+                                slow_phone_loss = (1 - label_smoothing) * slow_ctc_loss + label_smoothing * kl_div
+                            else:
+                                slow_phone_loss = torch.sum(slow_phone_loss)
+
+                            # Lambda weights for auxiliary losses
+                            lambda_fast = args.get("multiscale_lambda_fast", 0.3)
+                            lambda_slow = args.get("multiscale_lambda_slow", 0.3)
+
+                            # Total loss: main + auxiliary
+                            loss = loss + lambda_fast * fast_phone_loss + lambda_slow * slow_phone_loss
+
+                        # Log individual losses for monitoring
+                        if batch % 100 == 0:
+                            log_dict = {
+                                "train/phone_loss": phone_loss.item(),
+                                "train/diphone_loss": diphone_loss.item(),
+                                "train/alpha": alpha,
+                                "train/method": "marginalization_joint_multiscale" if has_multiscale else "marginalization_joint",
+                            }
+                            if has_multiscale:
+                                log_dict.update({
+                                    "train/fast_phone_loss": fast_phone_loss.item(),
+                                    "train/slow_phone_loss": slow_phone_loss.item(),
+                                    "train/lambda_fast": lambda_fast,
+                                    "train/lambda_slow": lambda_slow,
+                                })
+                            wandb.log(log_dict)
+                    else:
+                        # Fallback: only phoneme loss if no diphone labels
+                        loss = phone_loss
                 else:
-                    # No diphone loss, use only phoneme loss
-                    loss = phone_loss
+                    # OLD APPROACH: Separate phone and diphone heads
+                    # Phoneme CTC loss
+                    phone_loss = loss_ctc(
+                        phone_log_probs,
+                        y,
+                        out_lens,
+                        y_len,
+                    )
+
+                    # Apply label smoothing to phoneme loss if enabled
+                    if label_smoothing > 0:
+                        phone_ctc_loss = torch.mean(phone_loss)
+                        uniform_dist = torch.full_like(phone_log_probs, -math.log(n_classes))
+                        kl_div = F.kl_div(phone_log_probs, uniform_dist, reduction='batchmean', log_target=True)
+                        phone_loss = (1 - label_smoothing) * phone_ctc_loss + label_smoothing * kl_div
+                    else:
+                        phone_loss = torch.sum(phone_loss)
+
+                    # Diphone CTC loss (if enabled)
+                    if has_diphone and y_diphone is not None:
+                        # Create CTC loss for diphones (different blank token)
+                        diphone_blank_idx = diphone_vocab.blank_id
+                        if label_smoothing > 0:
+                            loss_ctc_diphone = torch.nn.CTCLoss(blank=diphone_blank_idx, reduction="none", zero_infinity=True)
+                        else:
+                            loss_ctc_diphone = torch.nn.CTCLoss(blank=diphone_blank_idx, reduction="mean", zero_infinity=True)
+
+                        diphone_loss = loss_ctc_diphone(
+                            diphone_log_probs,
+                            y_diphone,
+                            out_lens,
+                            y_diphone_len,
+                        )
+
+                        # Apply label smoothing to diphone loss if enabled
+                        if label_smoothing > 0:
+                            diphone_ctc_loss = torch.mean(diphone_loss)
+                            uniform_dist = torch.full_like(diphone_log_probs, -math.log(diphone_vocab.get_vocab_size()))
+                            kl_div = F.kl_div(diphone_log_probs, uniform_dist, reduction='batchmean', log_target=True)
+                            diphone_loss = (1 - label_smoothing) * diphone_ctc_loss + label_smoothing * kl_div
+                        else:
+                            diphone_loss = torch.sum(diphone_loss)
+
+                        # Joint loss with alpha weighting
+                        alpha = _get_diphone_alpha(
+                            batch,
+                            args["nBatch"],
+                            schedule=args.get("diphone_alpha_schedule", "constant")
+                        )
+                        loss = alpha * phone_loss + (1.0 - alpha) * diphone_loss
+
+                        # Log individual losses for monitoring
+                        if batch % 100 == 0:
+                            wandb.log({
+                                "train/phone_loss": phone_loss.item(),
+                                "train/diphone_loss": diphone_loss.item(),
+                                "train/alpha": alpha,
+                                "train/method": "separate_heads",
+                            })
+                    else:
+                        # No diphone loss, use only phoneme loss
+                        loss = phone_loss
 
         elif model_type == "transformer_ctc":
             model_output = model(X, dayIdx, X_len)
@@ -559,13 +698,19 @@ def trainModel(args):
                             total_seq_length += len(trueSeq)
 
                     elif model_type == "multiscale_ctc":
-                        # Multi-scale CTC decoding (handle both with and without diphone head)
+                        # Multi-scale CTC decoding (handle 2, 3, or 7 outputs)
                         model_output = model(X, testDayIdx, X_len)
 
-                        # Unpack output (may have 2 or 3 tensors)
-                        if len(model_output) == 3:
+                        # Unpack output - always use first two (phoneme predictions and lengths)
+                        if len(model_output) == 7:
+                            # Multi-scale with marginalization: 7 outputs
+                            # (phone, lens, diphone, fast_phone, fast_lens, slow_phone, slow_lens)
+                            pred, adjustedLens = model_output[0], model_output[1]
+                        elif len(model_output) == 3:
+                            # Marginalization without multi-scale: 3 outputs
                             pred, adjustedLens, _ = model_output  # Ignore diphone output during eval
                         else:
+                            # Baseline: 2 outputs
                             pred, adjustedLens = model_output
                         # pred is [T, B, C]
 

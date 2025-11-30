@@ -153,6 +153,44 @@ class DiphoneVocabulary:
         """Get total vocabulary size including blank token."""
         return self.num_diphones + 1  # +1 for blank
 
+    def get_num_phonemes(self) -> int:
+        """Get the number of unique phonemes (including boundary/blank)."""
+        # Find all unique phoneme IDs from diphone pairs
+        phonemes = set()
+        for (prev, curr) in self.diphone_to_id.keys():
+            phonemes.add(prev)
+            phonemes.add(curr)
+        return len(phonemes)
+
+    def create_marginalization_matrix(self, num_phonemes: int, phoneme_blank_id: int) -> np.ndarray:
+        """
+        Create a marginalization matrix to convert diphone probabilities to phoneme probabilities.
+
+        For each diphone (i, j), we want P(phoneme_j) to include this diphone's probability.
+        So the matrix has a 1.0 at position [diphone_id, j].
+
+        Args:
+            num_phonemes: Total number of phoneme classes (including blank)
+            phoneme_blank_id: The blank token ID for phonemes (usually the last index)
+
+        Returns:
+            Matrix of shape [num_diphones+1, num_phonemes] where entry [d, p] = 1.0
+            if diphone d has current phoneme p, else 0.0
+        """
+        # Initialize marginalization matrix
+        # Shape: [num_diphones + 1 (for blank), num_phonemes]
+        marg_matrix = np.zeros((self.num_diphones + 1, num_phonemes), dtype=np.float32)
+
+        # For each diphone (prev, curr) at index d, set matrix[d, curr] = 1.0
+        for (prev, curr), diphone_id in self.diphone_to_id.items():
+            # The diphone (prev, curr) contributes to phoneme 'curr'
+            marg_matrix[diphone_id, curr] = 1.0
+
+        # The diphone blank token maps to the phoneme blank token
+        marg_matrix[self.blank_id, phoneme_blank_id] = 1.0
+
+        return marg_matrix
+
 
 def build_and_save_diphone_vocab(
     dataset_path: str,
