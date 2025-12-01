@@ -1,12 +1,12 @@
 """
-FINAL OPTIMIZED Training Script
+FINAL OPTIMIZED Training Script (faster convergence)
 
-Fixed all configuration issues found in logic review:
-1. Use CONSTANT alpha (not scheduled) - prevents loss instability
-2. Multi-scale lambda 0.15 (not 0.05) - proven helpful, but not too strong
-3. Tiny label smoothing 0.02 (not 0.0) - better generalization
-4. Shorter warmup 20k (not 40k) - model learns fast early
-5. Grad clip 1.0 (not 1.5) - more stable
+Key choices:
+1. Constant alpha with phoneme bias (0.7) - speeds CER improvements
+2. Multi-scale lambda 0.1 - auxiliary heads help without dominating
+3. No label smoothing early - keep gradients sharp
+4. Short warmup 5k - reach effective LR quickly
+5. Grad clip 1.0 - stable updates
 """
 
 modelName = 'multiscale_diphone_final_v1'
@@ -19,7 +19,7 @@ args['maxTimeSeriesLen'] = 1200
 args['batchSize'] = 64
 
 # Aggressive but proven-stable LR
-args['lrStart'] = 0.002
+args['lrStart'] = 0.003
 args['lrEnd'] = 0.00005
 args['nUnits'] = 1024
 args['nBatch'] = 150000
@@ -51,9 +51,9 @@ args['optimizer'] = 'adamw'
 args['weight_decay'] = 1e-3
 
 # ===========================================================================
-# FIX #4: Shorter warmup (20k not 40k) - model learns fast early
+# FIX #4: Shorter warmup (5k) - model learns fast early
 # ===========================================================================
-args['warmup_steps'] = 20000  # Reduced from 40k
+args['warmup_steps'] = 5000  # Faster ramp to effective learning rate
 
 # ===========================================================================
 # FIX #5: More conservative grad clipping (1.0 not 1.5)
@@ -61,9 +61,9 @@ args['warmup_steps'] = 20000  # Reduced from 40k
 args['grad_clip_norm'] = 1.0  # More stable
 
 # ===========================================================================
-# FIX #3: Tiny label smoothing (0.02 not 0.0) - better generalization
+# FIX #3: No label smoothing early - keep gradients sharp
 # ===========================================================================
-args['label_smoothing'] = 0.02  # Tiny smoothing for generalization
+args['label_smoothing'] = 0.0  # Let gradients stay sharp early
 
 args['time_mask_param'] = 20
 
@@ -73,16 +73,17 @@ args['diphone_vocab_path'] = '/home/edward/neural_seq_decoder/diphone_vocab.pkl'
 args['use_diphone_marginalization'] = True
 
 # ===========================================================================
-# FIX #1: CONSTANT alpha (not scheduled) - prevents loss instability
+# FIX #1: CONSTANT alpha (phoneme-biased) - prevents loss instability
 # ===========================================================================
-args['diphone_alpha_schedule'] = 'constant'  # Stable 50/50 throughout
+args['diphone_alpha_schedule'] = 'constant'  # Stable weighting throughout
+args['diphone_alpha_constant'] = 0.7  # Bias toward phoneme loss early
 
 # ===========================================================================
-# FIX #2: Balanced auxiliary weights (0.15 not 0.05)
+# FIX #2: Balanced auxiliary weights (0.1 keeps focus on main head)
 # ===========================================================================
 args['use_multiscale_ctc'] = True
-args['multiscale_lambda_fast'] = 0.15  # Middle ground (proven helpful)
-args['multiscale_lambda_slow'] = 0.15  # Not too weak, not too strong
+args['multiscale_lambda_fast'] = 0.1  # Auxiliary heads still help but less dominant
+args['multiscale_lambda_slow'] = 0.1  # Auxiliary heads still help but less dominant
 
 print("=" * 80)
 print("FINAL OPTIMIZED CONFIGURATION")
@@ -90,20 +91,20 @@ print("=" * 80)
 print(f"Model: {modelName}")
 print()
 print("ALL LOGIC FIXES APPLIED:")
-print(f"  1. ✓ diphone_alpha = 'constant' (not scheduled - STABLE)")
-print(f"  2. ✓ multiscale_lambda = 0.15 (not 0.05 - BALANCED)")
-print(f"  3. ✓ label_smoothing = 0.02 (not 0.0 - GENERALIZATION)")
-print(f"  4. ✓ warmup_steps = 20k (not 40k - FASTER LEARNING)")
+print(f"  1. ✓ diphone_alpha = 'constant' (phoneme-biased 0.7 - STABLE)")
+print(f"  2. ✓ multiscale_lambda = 0.1 (auxiliary but not dominant)")
+print(f"  3. ✓ label_smoothing = 0.0 (sharp gradients early)")
+print(f"  4. ✓ warmup_steps = 5k (reach peak LR faster)")
 print(f"  5. ✓ grad_clip_norm = 1.0 (not 1.5 - MORE STABLE)")
 print()
 print("WHY THESE FIXES:")
 print("  Issue 1: Scheduled alpha caused loss to increase (moving target)")
-print("  Issue 2: Lambda 0.05 too weak (simple baseline proved it helps)")
-print("  Issue 3: No smoothing → overconfident predictions")
-print("  Issue 4: 40k warmup too long (model learns fast early)")
+print("  Issue 2: Aux weight too weak/strong; 0.1 keeps focus on main head")
+print("  Issue 3: Early smoothing can slow convergence; off for now")
+print("  Issue 4: Very long warmup slows learning")
 print("  Issue 5: 1.5 grad clip less stable than 1.0")
 print()
-print("EXPECTED: Best performance, stable training, breakthrough plateau")
+print("EXPECTED: Faster early CER drop, stable training, better final CER")
 print("TARGET: 0.15-0.22 CER (realistic with all fixes)")
 print("=" * 80)
 print()

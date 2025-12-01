@@ -86,7 +86,7 @@ def _compute_output_lengths(model, x_lens):
         return ((x_lens - model.kernelLen) / model.strideLen).to(torch.int32)
 
 
-def _get_diphone_alpha(batch, total_batches, schedule="constant"):
+def _get_diphone_alpha(batch, total_batches, schedule="constant", constant_alpha=0.5):
     """
     Compute alpha weight for phoneme vs diphone loss.
     alpha = 1.0 means 100% phoneme loss
@@ -97,7 +97,7 @@ def _get_diphone_alpha(batch, total_batches, schedule="constant"):
     """
     if schedule == "constant":
         # Simple 50/50 weighting
-        return 0.5
+        return constant_alpha
     elif schedule == "scheduled":
         # Paper-style schedule:
         # First 20%: alpha = 0.3 (lean more on diphones)
@@ -444,11 +444,12 @@ def trainModel(args):
 
                         # JOINT LOSS with alpha weighting (proper DCoND Step 2!)
                         # Both losses provide gradient signal to the same diphone_head
-                        alpha = _get_diphone_alpha(
-                            batch,
-                            args["nBatch"],
-                            schedule=args.get("diphone_alpha_schedule", "constant")
-                        )
+                            alpha = _get_diphone_alpha(
+                                batch,
+                                args["nBatch"],
+                                schedule=args.get("diphone_alpha_schedule", "constant"),
+                                constant_alpha=args.get("diphone_alpha_constant", 0.5),
+                            )
                         loss = alpha * phone_loss + (1.0 - alpha) * diphone_loss
 
                         # STEP 3: Add multi-scale auxiliary losses if enabled
@@ -557,7 +558,8 @@ def trainModel(args):
                         alpha = _get_diphone_alpha(
                             batch,
                             args["nBatch"],
-                            schedule=args.get("diphone_alpha_schedule", "constant")
+                            schedule=args.get("diphone_alpha_schedule", "constant"),
+                            constant_alpha=args.get("diphone_alpha_constant", 0.5),
                         )
                         loss = alpha * phone_loss + (1.0 - alpha) * diphone_loss
 
