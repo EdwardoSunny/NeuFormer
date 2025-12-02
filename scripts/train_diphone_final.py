@@ -18,11 +18,11 @@ args['seqLen'] = 150
 args['maxTimeSeriesLen'] = 1200
 args['batchSize'] = 64
 
-# Slightly more conservative LR peak
-args['lrStart'] = 0.002
+# Requested LR peak
+args['lrStart'] = 0.003
 args['lrEnd'] = 0.00005
 args['nUnits'] = 1024
-args['nBatch'] = 150000
+args['nBatch'] = 200000
 args['nLayers'] = 5
 args['seed'] = 0
 args['nClasses'] = 40
@@ -51,9 +51,9 @@ args['optimizer'] = 'adamw'
 args['weight_decay'] = 1e-3
 
 # ===========================================================================
-# FIX #4: Moderate warmup (10k) - smoother ramp to peak LR
+# FIX #4: Warmup per request (7.5k) - reach peak LR reasonably fast
 # ===========================================================================
-args['warmup_steps'] = 10000  # Longer ramp for stability
+args['warmup_steps'] = 7500
 
 # ===========================================================================
 # FIX #5: More conservative grad clipping (1.0 not 1.5)
@@ -65,7 +65,7 @@ args['grad_clip_norm'] = 1.0  # More stable
 # ===========================================================================
 args['label_smoothing'] = 0.01
 
-args['time_mask_param'] = 10
+args['time_mask_param'] = 20
 
 # Diphone configuration
 args['use_diphone_head'] = True
@@ -94,7 +94,7 @@ print("ALL LOGIC FIXES APPLIED:")
 print(f"  1. ✓ diphone_alpha = 'constant' (phoneme-biased 0.6 - STABLE)")
 print(f"  2. ✓ multiscale_lambda = 0.1 (auxiliary but not dominant)")
 print(f"  3. ✓ label_smoothing = 0.01 (light smoothing for stability)")
-print(f"  4. ✓ warmup_steps = 10k (reach peak LR with gentle ramp)")
+print(f"  4. ✓ warmup_steps = 7.5k (reach peak LR per request)")
 print(f"  5. ✓ grad_clip_norm = 1.0 (not 1.5 - MORE STABLE)")
 print()
 print("WHY THESE FIXES:")
