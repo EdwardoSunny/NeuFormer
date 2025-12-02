@@ -195,6 +195,8 @@ def trainModel(args):
             num_diphones=diphone_vocab.get_vocab_size() if diphone_vocab is not None else 1012,
             diphone_marginalization_matrix=diphone_marginalization_matrix,  # Step 1+2: Pass marginalization matrix
             use_multiscale_ctc=args.get("use_multiscale_ctc", False),  # Step 3: Enable multi-scale CTC heads
+            medium_encoder_layers=args.get("medium_encoder_layers"),
+            aux_encoder_layers=args.get("aux_encoder_layers"),
             device=device,
         ).to(device)
     elif args.get("model_type", "gru_baseline") == "transformer_ctc":

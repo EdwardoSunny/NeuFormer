@@ -754,12 +754,20 @@ class MultiScaleConformerEncoder(nn.Module):
         input_dim: int,
         d_model: int,
         n_layers: int = 6,
+        medium_layers: Optional[int] = None,
+        aux_layers: Optional[int] = None,
         n_heads: int = 8,
         dim_ff: int = 2048,
         dropout: float = 0.1,
         conv_kernel: int = 31,
     ):
         super().__init__()
+
+        # Allow overriding medium/aux layer counts independently
+        if medium_layers is None:
+            medium_layers = n_layers
+        if aux_layers is None:
+            aux_layers = max(1, n_layers // 2)
 
         # Three parallel pathways at different temporal scales
         # Fast path: stride 2 (~75ms resolution)
@@ -768,7 +776,7 @@ class MultiScaleConformerEncoder(nn.Module):
         )
         self.fast_conformer = nn.ModuleList([
             ConformerBlock(d_model, n_heads, dim_ff, dropout, conv_kernel)
-            for _ in range(n_layers // 2)  # Fewer layers for fast path
+            for _ in range(aux_layers)  # Fewer layers for fast path
         ])
 
         # Medium path: stride 4 (~150ms resolution) - main pathway
@@ -777,7 +785,7 @@ class MultiScaleConformerEncoder(nn.Module):
         )
         self.medium_conformer = nn.ModuleList([
             ConformerBlock(d_model, n_heads, dim_ff, dropout, conv_kernel)
-            for _ in range(n_layers)
+            for _ in range(medium_layers)
         ])
 
         # Slow path: stride 8 (~300ms resolution)
@@ -786,7 +794,7 @@ class MultiScaleConformerEncoder(nn.Module):
         )
         self.slow_conformer = nn.ModuleList([
             ConformerBlock(d_model, n_heads, dim_ff, dropout, conv_kernel)
-            for _ in range(n_layers // 2)
+            for _ in range(aux_layers)
         ])
 
         # Cross-scale fusion
@@ -1104,6 +1112,8 @@ class MultiScaleCTCDecoder(nn.Module):
         input_dim: int = 256,
         d_model: int = 512,
         encoder_layers: int = 6,
+        medium_encoder_layers: Optional[int] = None,
+        aux_encoder_layers: Optional[int] = None,
         n_heads: int = 8,
         dim_ff: int = 2048,
         dropout: float = 0.1,
@@ -1157,6 +1167,8 @@ class MultiScaleCTCDecoder(nn.Module):
             input_dim=input_dim,
             d_model=d_model,
             n_layers=encoder_layers,
+            medium_layers=medium_encoder_layers,
+            aux_layers=aux_encoder_layers,
             n_heads=n_heads,
             dim_ff=dim_ff,
             dropout=dropout,
