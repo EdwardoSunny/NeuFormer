@@ -33,24 +33,3 @@ dropout: 0.4
 strideLen: 4
 kernelLen: 32
 bidirectional: True
-
-# Model selection
-model_type: transformer_ctc  # options: gru_baseline, transformer_ctc
-
-# Transformer / frontend settings
-use_wavelets: True
-use_pac_features: False
-wavelet_n_scales: 4
-wavelet_window_bins: 5
-wavelet_stride_bins: 1
-frontend_dim: 512
-latent_dim: 256
-transformer_num_layers: 4
-transformer_n_heads: 4
-transformer_dim_ff: 1024
-transformer_dropout: 0.1
-
-# Optimizer / scheduler
-optimizer: adamw
-weight_decay: 1e-2
-warmup_steps: 500
