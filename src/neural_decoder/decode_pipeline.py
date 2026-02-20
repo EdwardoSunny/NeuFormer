@@ -49,29 +49,29 @@ class PipelineConfig:
     """Configuration for the full decoding pipeline."""
 
     # A1 – CTC beam search
-    beam_width: int = 25
-    n_best: int = 10
+    beam_width: int = 40
+    n_best: int = 25
     blank_penalty: float = 0.0
 
     # A2 – Lexicon
     max_edit_dist: int = 1
-    lexicon_beam_width: int = 10
+    lexicon_beam_width: int = 5
 
     # B1 – Uncertainty
     entropy_threshold: float = 1.5
     margin_threshold: float = 0.3
 
     # B2 – Constrained hypothesis
-    high_confidence_threshold: float = 0.7
+    high_confidence_threshold: float = 0.85
     max_candidates_per_slot: int = 20
 
     # C – LLM
     llm_model_name: str = "meta-llama/Meta-Llama-3-8B"
     llm_device: str = "cpu"
     llm_load_in_8bit: bool = False
-    lambda_neural: float = 1.0
-    lambda_lm: float = 0.5
-    gamma_constraint: float = 5.0
+    lambda_neural: float = 0.5
+    lambda_lm: float = 1.0
+    gamma_constraint: float = 2.0
     length_penalty_beta: float = 0.0
     slot_filling_beam: int = 10
 
@@ -216,13 +216,19 @@ class DecodePipeline:
         # ---- A2: Phoneme → Word ----
         t_lex = time.time()
         word_hyps: List[Tuple[List[str], float]] = []
+        T_frames = (
+            log_probs.shape[0] if length is None else min(log_probs.shape[0], length)
+        )
         for hyp in hyps:
             w_results = self.lexicon.phonemes_to_words(
                 hyp.phoneme_ids, beam_width=self.config.lexicon_beam_width
             )
+            # Normalize CTC log-prob per frame so it's comparable to
+            # per-token LLM scores (both will be in ~ [-1, -10] range)
+            norm_ctc = hyp.log_prob / max(T_frames, 1)
             for words, edit_cost in w_results:
-                # Combine CTC log_prob with negative edit cost
-                combined = hyp.log_prob - edit_cost
+                # Combine normalized CTC score with edit cost penalty
+                combined = norm_ctc - edit_cost
                 word_hyps.append((words, combined))
 
         # De-duplicate and sort

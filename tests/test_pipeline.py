@@ -862,7 +862,11 @@ class TestCTCForcedAlignment(unittest.TestCase):
             self.assertAlmostEqual(row_sum, 1.0, places=2)
 
     def test_hypothesis_has_label_posteriors(self):
-        """Beam decoder should produce label_posteriors for each hypothesis."""
+        """Beam decoder should produce label_posteriors for the 1-best hypothesis.
+
+        Only the top-ranked hypothesis gets full forward-backward posteriors;
+        lower-ranked hypotheses use cheap argmax alignment (label_posteriors=None).
+        """
         from neural_decoder.ctc_beam_decoder import CTCBeamDecoder
 
         T, C = 10, 41
@@ -876,9 +880,13 @@ class TestCTCForcedAlignment(unittest.TestCase):
 
         decoder = CTCBeamDecoder(beam_width=5, n_best=3)
         results = decoder.decode(log_probs)
-        for hyp in results:
-            self.assertIsNotNone(hyp.label_posteriors)
-            self.assertEqual(hyp.label_posteriors.shape[0], T)
+        # 1-best must have label_posteriors
+        self.assertIsNotNone(results[0].label_posteriors)
+        self.assertEqual(results[0].label_posteriors.shape[0], T)
+        # Non-top hypotheses may have label_posteriors=None (optimization)
+        for hyp in results[1:]:
+            if hyp.label_posteriors is not None:
+                self.assertEqual(hyp.label_posteriors.shape[0], T)
 
 
 class TestDPSegmentation(unittest.TestCase):

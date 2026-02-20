@@ -191,20 +191,69 @@ class ConstrainedHypothesisBuilder:
 
             slots.append(slot)
 
-        # Populate open-slot candidates from N-best hypotheses
+        # Populate open-slot candidates from N-best hypotheses.
+        # Use edit-distance alignment to handle different-length hypotheses
+        # (insertions/deletions mean positional indices don't correspond).
         for hyp_words, hyp_score in word_hypotheses[1:]:
-            for i, slot in enumerate(slots):
+            alignment = self._align_word_sequences(best_words, hyp_words)
+            for best_idx, hyp_idx in alignment:
+                if best_idx is None or hyp_idx is None:
+                    continue
+                slot = slots[best_idx]
                 if slot.is_locked:
                     continue
-                if i < len(hyp_words):
-                    alt = hyp_words[i]
-                    if alt not in slot.candidates:
-                        slot.candidates.append(alt)
-                        slot.neural_scores[alt] = hyp_score
-                    if len(slot.candidates) >= self.max_candidates_per_slot:
-                        break
+                alt = hyp_words[hyp_idx]
+                if alt not in slot.candidates:
+                    slot.candidates.append(alt)
+                    slot.neural_scores[alt] = hyp_score
+                if len(slot.candidates) >= self.max_candidates_per_slot:
+                    break
 
         return ConstrainedTemplate(slots=slots, neural_score=best_score)
+
+    @staticmethod
+    def _align_word_sequences(
+        ref: List[str], hyp: List[str]
+    ) -> List[Tuple[Optional[int], Optional[int]]]:
+        """
+        Align two word sequences using edit-distance backtracking.
+
+        Returns list of (ref_idx, hyp_idx) pairs. None means insertion/deletion.
+        """
+        m, n = len(ref), len(hyp)
+        # DP table
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+        for i in range(m + 1):
+            dp[i][0] = i
+        for j in range(n + 1):
+            dp[0][j] = j
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                if ref[i - 1] == hyp[j - 1]:
+                    dp[i][j] = dp[i - 1][j - 1]
+                else:
+                    dp[i][j] = 1 + min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1])
+
+        # Backtrack
+        alignment: List[Tuple[Optional[int], Optional[int]]] = []
+        i, j = m, n
+        while i > 0 or j > 0:
+            if (
+                i > 0
+                and j > 0
+                and (ref[i - 1] == hyp[j - 1] or dp[i][j] == dp[i - 1][j - 1] + 1)
+            ):
+                alignment.append((i - 1, j - 1))
+                i -= 1
+                j -= 1
+            elif i > 0 and dp[i][j] == dp[i - 1][j] + 1:
+                alignment.append((i - 1, None))
+                i -= 1
+            else:
+                alignment.append((None, j - 1))
+                j -= 1
+        alignment.reverse()
+        return alignment
 
 
 # ======================================================================

@@ -98,6 +98,9 @@ class PronunciationLexicon:
         self.entries: Dict[str, LexiconEntry] = {}
         # Reverse index: tuple of phoneme IDs → list of words
         self._pron_to_words: Dict[Tuple[int, ...], List[str]] = defaultdict(list)
+        # Length-indexed reverse index for fast fuzzy matching:
+        # pron_length → list of (word, pronunciation) pairs
+        self._length_index: Dict[int, List[Tuple[str, List[int]]]] = defaultdict(list)
         self._g2p = None  # lazy loaded
         self._cmudict: Optional[Dict[str, List[List[str]]]] = None
         self._cmudict_loaded = False
@@ -267,6 +270,7 @@ class PronunciationLexicon:
             if pron not in entry.pronunciations:
                 entry.pronunciations.append(pron)
                 self._pron_to_words[tuple(pron)].append(word_lower)
+                self._length_index[len(pron)].append((word_lower, pron))
 
     def build_from_sentences(self, sentences: List[str]):
         """
@@ -500,16 +504,23 @@ class PronunciationLexicon:
         if candidates:
             return candidates[:max_candidates]
 
-        # Fuzzy match: iterate over lexicon entries
+        # Fuzzy match: use length-indexed lookup to avoid scanning
+        # all entries.  Only check pronunciations within ±max_edit_dist
+        # of the chunk length, reducing O(V) to O(V_similar_length).
         best: List[Tuple[str, float]] = []
-        for entry in self.entries.values():
-            for pron in entry.pronunciations:
-                # Quick length filter
-                if abs(len(pron) - len(chunk)) > self.max_edit_dist:
+        seen_words: set = set()
+        chunk_len = len(chunk)
+        for pron_len in range(
+            max(1, chunk_len - self.max_edit_dist),
+            chunk_len + self.max_edit_dist + 1,
+        ):
+            for word, pron in self._length_index.get(pron_len, []):
+                if word in seen_words:
                     continue
                 dist = _edit_distance(chunk, pron)
                 if dist <= self.max_edit_dist:
-                    best.append((entry.word, float(dist)))
+                    best.append((word, float(dist)))
+                    seen_words.add(word)
 
         best.sort(key=lambda x: x[1])
         return best[:max_candidates]

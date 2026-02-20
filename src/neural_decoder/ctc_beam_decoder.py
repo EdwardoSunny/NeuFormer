@@ -379,17 +379,21 @@ class CTCBeamDecoder:
         )
 
         results: List[CTCHypothesis] = []
-        for prefix in sorted_prefixes[: self.n_best]:
+        for rank, prefix in enumerate(sorted_prefixes[: self.n_best]):
             phone_ids = list(prefix)
 
-            # CTC forced alignment constrained to this hypothesis
-            if phone_ids:
+            # Only run expensive forced alignment + forward-backward
+            # on the 1-best hypothesis (used for uncertainty estimation).
+            # Other hypotheses get a cheap argmax alignment.
+            if rank == 0 and phone_ids:
                 alignment, _ = ctc_forced_align(log_probs, phone_ids, blank=self.blank)
-                # Forward-backward posteriors for uncertainty
                 gamma = ctc_forward_backward(log_probs, phone_ids, blank=self.blank)
+            elif phone_ids:
+                alignment = np.argmax(log_probs, axis=-1).tolist()
+                gamma = None
             else:
                 alignment = [self.blank] * T
-                gamma = np.ones((T, 1), dtype=np.float64)
+                gamma = None
 
             results.append(
                 CTCHypothesis(
