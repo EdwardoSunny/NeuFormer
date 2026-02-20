@@ -58,6 +58,7 @@ def getDatasetLoaders(
 
     return train_loader, test_loader, loadedData
 
+
 def trainModel(args):
     os.makedirs(args["outputDir"], exist_ok=True)
     torch.manual_seed(args["seed"])
@@ -72,7 +73,9 @@ def trainModel(args):
         project=args.get("wandb_project", "neural-speech-decoder"),
         name=args.get("wandb_run_name", os.path.basename(args["outputDir"])),
         config=args,
-        mode=args.get("wandb_mode", "online"),  # Can be "online", "offline", or "disabled"
+        mode=args.get(
+            "wandb_mode", "online"
+        ),  # Can be "online", "offline", or "disabled"
     )
 
     trainLoader, testLoader, loadedData = getDatasetLoaders(
@@ -124,10 +127,12 @@ def trainModel(args):
     # Log model info
     num_params = sum(p.numel() for p in model.parameters())
     num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    wandb.log({
-        "model/total_parameters": num_params,
-        "model/trainable_parameters": num_trainable_params,
-    })
+    wandb.log(
+        {
+            "model/total_parameters": num_params,
+            "model/trainable_parameters": num_trainable_params,
+        }
+    )
     print(f"Model has {num_params:,} parameters ({num_trainable_params:,} trainable)")
 
     blank_idx = 0
@@ -136,9 +141,13 @@ def trainModel(args):
     # Label smoothing for better generalization (Conformer only)
     label_smoothing = args.get("label_smoothing", 0.0)
     if label_smoothing > 0:
-        loss_ctc = torch.nn.CTCLoss(blank=blank_idx, reduction="none", zero_infinity=True)
+        loss_ctc = torch.nn.CTCLoss(
+            blank=blank_idx, reduction="none", zero_infinity=True
+        )
     else:
-        loss_ctc = torch.nn.CTCLoss(blank=blank_idx, reduction="mean", zero_infinity=True)
+        loss_ctc = torch.nn.CTCLoss(
+            blank=blank_idx, reduction="mean", zero_infinity=True
+        )
 
     # Optimizer and scheduler
     if args.get("optimizer", "adam") == "adamw":
@@ -236,7 +245,9 @@ def trainModel(args):
             ctc_loss = torch.mean(loss)
             # Uniform distribution for label smoothing
             uniform_dist = torch.full_like(log_probs, -math.log(n_classes))
-            kl_div = torch.nn.functional.kl_div(log_probs, uniform_dist, reduction='batchmean', log_target=True)
+            kl_div = torch.nn.functional.kl_div(
+                log_probs, uniform_dist, reduction="batchmean", log_target=True
+            )
             main_loss = (1 - label_smoothing) * ctc_loss + label_smoothing * kl_div
         else:
             main_loss = torch.sum(loss)
@@ -260,7 +271,7 @@ def trainModel(args):
         scheduler.step()
 
         # Log training metrics every step
-        current_lr = optimizer.param_groups[0]['lr']
+        current_lr = optimizer.param_groups[0]["lr"]
         log_dict = {
             "train/loss": loss.item(),
             "train/learning_rate": current_lr,
@@ -297,7 +308,9 @@ def trainModel(args):
                         # pred is [T, B, C], ignore intermediate output during eval
                     else:
                         logits = model.forward(X, testDayIdx)
-                        adjustedLens = ((X_len - model.kernelLen) / model.strideLen).to(torch.int32)
+                        adjustedLens = ((X_len - model.kernelLen) / model.strideLen).to(
+                            torch.int32
+                        )
                         pred = logits.log_softmax(2).permute(1, 0, 2)
 
                     loss = loss_ctc(
@@ -368,26 +381,31 @@ def trainModel(args):
                 pickle.dump(tStats, file)
 
     # Log final summary
-    final_cer = testCER[-1] if len(testCER) > 0 else float('inf')
-    best_cer = np.min(testCER) if len(testCER) > 0 else float('inf')
-    wandb.log({
-        "summary/final_cer": final_cer,
-        "summary/best_cer": best_cer,
-        "summary/final_loss": testLoss[-1] if len(testLoss) > 0 else float('inf'),
-        "summary/best_loss": np.min(testLoss) if len(testLoss) > 0 else float('inf'),
-    })
+    final_cer = testCER[-1] if len(testCER) > 0 else float("inf")
+    best_cer = np.min(testCER) if len(testCER) > 0 else float("inf")
+    wandb.log(
+        {
+            "summary/final_cer": final_cer,
+            "summary/best_cer": best_cer,
+            "summary/final_loss": testLoss[-1] if len(testLoss) > 0 else float("inf"),
+            "summary/best_loss": np.min(testLoss)
+            if len(testLoss) > 0
+            else float("inf"),
+        }
+    )
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Training completed!")
     print(f"Final CER: {final_cer:.6f}")
     print(f"Best CER: {best_cer:.6f}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     # Finish wandb run
     wandb.finish()
 
 
 def loadModel(modelDir, nInputLayers=24, device="cuda"):
+    """Load a trained GRU model from a saved directory."""
     modelWeightPath = modelDir + "/modelWeights"
     with open(modelDir + "/args", "rb") as handle:
         args = pickle.load(handle)
@@ -410,10 +428,41 @@ def loadModel(modelDir, nInputLayers=24, device="cuda"):
     return model
 
 
+def loadConformerModel(modelDir, nInputLayers=24, device="cuda"):
+    """Load a trained Conformer model from a saved directory."""
+    modelWeightPath = modelDir + "/modelWeights"
+    with open(modelDir + "/args", "rb") as handle:
+        args = pickle.load(handle)
+
+    model = NeuralTransformerCTCModel(
+        n_channels=args["nInputFeatures"],
+        n_classes=args["nClasses"] + 1,  # +1 for CTC blank
+        n_days=nInputLayers,
+        frontend_dim=args.get("frontend_dim", 1024),
+        latent_dim=args.get("latent_dim", 1024),
+        autoencoder_hidden_dim=args.get("autoencoder_hidden_dim", 512),
+        transformer_layers=args.get("transformer_num_layers", 8),
+        transformer_heads=args.get("transformer_n_heads", 8),
+        transformer_ff_dim=args.get("transformer_dim_ff", 2048),
+        transformer_dropout=args.get("transformer_dropout", 0.3),
+        temporal_kernel=args.get("temporal_kernel", 32),
+        temporal_stride=args.get("temporal_stride", 4),
+        gaussian_smooth_width=args.get("gaussian_smooth_width", 2.0),
+        conformer_conv_kernel=args.get("conformer_conv_kernel", 31),
+        use_spec_augment=False,  # Disabled during inference
+        drop_path_prob=0.0,  # Disabled during inference
+        device=device,
+    ).to(device)
+
+    model.load_state_dict(torch.load(modelWeightPath, map_location=device))
+    return model
+
+
 @hydra.main(version_base="1.1", config_path="conf", config_name="config")
 def main(cfg):
     cfg.outputDir = os.getcwd()
     trainModel(cfg)
+
 
 if __name__ == "__main__":
     main()
