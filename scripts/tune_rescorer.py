@@ -55,6 +55,7 @@ class CachedUtterance:
     candidate_lists: List[List[str]]  # word sequences
     neural_scores: List[float]  # per-candidate neural scores
     lm_scores: List[float]  # per-candidate LLM scores
+    ngram_scores: List[float]  # per-candidate N-gram scores
     # Confidence for template building
     word_confidences: List[Tuple[str, float]]
     # Reference
@@ -67,6 +68,7 @@ class TuneResult:
 
     lambda_neural: float
     lambda_lm: float
+    lambda_ngram: float
     gamma_constraint: float
     length_penalty_beta: float
     high_confidence_threshold: float
@@ -149,9 +151,10 @@ def precompute_scores(
             print(f"  {i + 1}/{len(utterances)} utterances processed")
     print(f"  Neural decoding took {time.time() - t0:.1f}s")
 
-    # Phase 2: Batch LLM scoring of all candidates
-    print("Phase 2: LLM scoring all candidates...")
+    # Phase 2: N-gram + LLM scoring of all candidates
+    print("Phase 2: N-gram + LLM scoring all candidates...")
     llm = pipeline._get_llm()
+    ngram_lm = pipeline._ngram_lm  # May be None if N-gram disabled
 
     cached = []
     all_candidate_sets = []
@@ -167,6 +170,7 @@ def precompute_scores(
                     candidate_lists=[ref_words] if ref_words else [[]],
                     neural_scores=[0.0],
                     lm_scores=[0.0],
+                    ngram_scores=[0.0],
                     word_confidences=[],
                     ref_words=ref_words,
                 )
@@ -179,8 +183,15 @@ def precompute_scores(
         cand_lists = [wh[0] for wh in result.word_hypotheses[:n_cands]]
         neural_scores = [wh[1] for wh in result.word_hypotheses[:n_cands]]
 
-        # Batch LLM scoring
         sentences = [" ".join(words) for words in cand_lists]
+
+        # N-gram scoring (fast)
+        if ngram_lm is not None and ngram_lm.is_ready:
+            ngram_scores = [ngram_lm.score_sentence(s) for s in sentences]
+        else:
+            ngram_scores = [0.0] * n_cands
+
+        # Batch LLM scoring
         lm_scores = llm.score_batch(sentences)
 
         word_conf_tuples = [(wc.word, wc.confidence) for wc in result.word_confidences]
@@ -190,6 +201,7 @@ def precompute_scores(
                 candidate_lists=cand_lists,
                 neural_scores=neural_scores,
                 lm_scores=lm_scores,
+                ngram_scores=ngram_scores,
                 word_confidences=word_conf_tuples,
                 ref_words=ref_words,
             )
@@ -209,6 +221,7 @@ def rescore_with_params(
     cached_utts: List[CachedUtterance],
     lambda_neural: float,
     lambda_lm: float,
+    lambda_ngram: float,
     gamma_constraint: float,
     length_penalty_beta: float,
     high_confidence_threshold: float,
@@ -218,8 +231,7 @@ def rescore_with_params(
     """
     Rescore all utterances using cached scores and given hyperparams.
 
-    This is very fast — no neural model or LLM calls, just linear
-    combination of pre-computed scores.
+    Three-weight formula: alpha*CTC + beta*ngram + gamma*LLM
     """
     from neural_decoder.constrained_decode import (
         ConstrainedHypothesisBuilder,
@@ -241,24 +253,23 @@ def rescore_with_params(
 
         ns_arr = np.array(cu.neural_scores, dtype=np.float64)
         lm_arr = np.array(cu.lm_scores, dtype=np.float64)
+        ng_arr = np.array(cu.ngram_scores, dtype=np.float64)
 
         # Z-score normalise if requested
         if normalize and len(ns_arr) > 1:
-            ns_std = np.std(ns_arr)
-            lm_std = np.std(lm_arr)
-            if ns_std > 1e-8:
-                ns_arr = (ns_arr - np.mean(ns_arr)) / ns_std
-            else:
-                ns_arr = ns_arr - np.mean(ns_arr)
-            if lm_std > 1e-8:
-                lm_arr = (lm_arr - np.mean(lm_arr)) / lm_std
-            else:
-                lm_arr = lm_arr - np.mean(lm_arr)
+            for arr in [ns_arr, lm_arr, ng_arr]:
+                std = np.std(arr)
+                if std > 1e-8:
+                    arr -= np.mean(arr)
+                    arr /= std
+                else:
+                    arr -= np.mean(arr)
 
         if mode == "unconstrained_rescore":
-            # Simple linear combination
+            # Three-weight linear combination
             combined = (
                 lambda_neural * ns_arr
+                + lambda_ngram * ng_arr
                 + lambda_lm * lm_arr
                 + length_penalty_beta * np.array([len(c) for c in cu.candidate_lists])
             )
@@ -283,9 +294,11 @@ def rescore_with_params(
             best_score = float("-inf")
             best_words = cu.candidate_lists[0]
 
-            for i, (words, ns, lm) in enumerate(
-                zip(cu.candidate_lists, ns_arr.tolist(), lm_arr.tolist())
-            ):
+            for i, words in enumerate(cu.candidate_lists):
+                ns = ns_arr[i]
+                lm = lm_arr[i]
+                ng = ng_arr[i]
+
                 # Constraint penalty
                 penalty = 0.0
                 if template_words and words:
@@ -299,14 +312,15 @@ def rescore_with_params(
                         if slot.is_locked and words[cand_idx] != slot.locked_word:
                             penalty += gamma_constraint
 
-                combined = (
+                score = (
                     lambda_neural * ns
+                    + lambda_ngram * ng
                     + lambda_lm * lm
                     - penalty
                     + length_penalty_beta * len(words)
                 )
-                if combined > best_score:
-                    best_score = combined
+                if score > best_score:
+                    best_score = score
                     best_words = words
 
             all_pred_words.append(best_words)
@@ -332,21 +346,23 @@ def grid_search(
     all_ref_words = [cu.ref_words for cu in cached_utts]
     ow = oracle_wer(all_cand_sets, all_ref_words)
 
-    # Grid definition
-    lambda_neural_values = [0.1, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0]
-    lambda_lm_values = [0.1, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0]
-    length_penalty_values = [0.0, 0.05, 0.1, 0.2]
+    # Grid definition — 3-weight formula
+    lambda_neural_values = [0.3, 0.5, 0.7, 1.0, 1.5]
+    lambda_ngram_values = [0.0, 0.3, 0.5, 0.7, 1.0, 1.5]
+    lambda_lm_values = [0.0, 0.3, 0.5, 0.7, 1.0, 1.5]
+    length_penalty_values = [0.0, 0.05, 0.1]
     normalize_values = [True, False]
 
     if mode == "constrained_rescore":
-        gamma_values = [0.0, 0.5, 1.0, 2.0, 5.0]
-        threshold_values = [0.5, 0.7, 0.85, 0.95]
+        gamma_values = [0.0, 0.5, 1.0, 2.0]
+        threshold_values = [0.5, 0.7, 0.85]
     else:
         gamma_values = [0.0]
         threshold_values = [0.85]
 
     total = (
         len(lambda_neural_values)
+        * len(lambda_ngram_values)
         * len(lambda_lm_values)
         * len(length_penalty_values)
         * len(normalize_values)
@@ -364,8 +380,9 @@ def grid_search(
     n_done = 0
     t0 = time.time()
 
-    for ln, ll, lp, norm, gc, thr in itertools.product(
+    for ln, lng, ll, lp, norm, gc, thr in itertools.product(
         lambda_neural_values,
+        lambda_ngram_values,
         lambda_lm_values,
         length_penalty_values,
         normalize_values,
@@ -376,6 +393,7 @@ def grid_search(
             cached_utts,
             lambda_neural=ln,
             lambda_lm=ll,
+            lambda_ngram=lng,
             gamma_constraint=gc,
             length_penalty_beta=lp,
             high_confidence_threshold=thr,
@@ -385,6 +403,7 @@ def grid_search(
         result = TuneResult(
             lambda_neural=ln,
             lambda_lm=ll,
+            lambda_ngram=lng,
             gamma_constraint=gc,
             length_penalty_beta=lp,
             high_confidence_threshold=thr,
@@ -402,10 +421,10 @@ def grid_search(
                 elapsed = time.time() - t0
                 print(
                     f"  [{n_done}/{total}] NEW BEST WER={wer:.4f}  "
-                    f"ln={ln} ll={ll} gc={gc} lp={lp} thr={thr} "
+                    f"ln={ln} lng={lng} ll={ll} gc={gc} lp={lp} thr={thr} "
                     f"norm={norm}  ({elapsed:.1f}s)"
                 )
-        elif verbose and n_done % 200 == 0:
+        elif verbose and n_done % 500 == 0:
             elapsed = time.time() - t0
             print(f"  [{n_done}/{total}] best so far: {best_wer:.4f}  ({elapsed:.1f}s)")
 
@@ -488,14 +507,15 @@ def main():
     # Print top-10
     print("\n=== Top 10 Configurations ===")
     print(
-        f"{'Rank':<6} {'WER':>8} {'ln':>6} {'ll':>6} {'gc':>6} "
+        f"{'Rank':<6} {'WER':>8} {'ln':>6} {'lng':>6} {'ll':>6} {'gc':>6} "
         f"{'lp':>6} {'thr':>6} {'norm':>6}"
     )
-    print("-" * 56)
+    print("-" * 64)
     for i, r in enumerate(results[:10]):
         print(
             f"{i + 1:<6} {r.wer:>8.4f} {r.lambda_neural:>6.2f} "
-            f"{r.lambda_lm:>6.2f} {r.gamma_constraint:>6.2f} "
+            f"{r.lambda_ngram:>6.2f} {r.lambda_lm:>6.2f} "
+            f"{r.gamma_constraint:>6.2f} "
             f"{r.length_penalty_beta:>6.2f} {r.high_confidence_threshold:>6.2f} "
             f"{'Y' if r.normalize_scores else 'N':>6}"
         )

@@ -34,6 +34,7 @@ from .constrained_decode import (
     SlotFillingDecoder,
 )
 from .llm_scorer import LLMScorer
+from .ngram_lm import NgramLM
 from .distillation import (
     CandidateFeatures,
     DistillationDataCollector,
@@ -51,12 +52,18 @@ class PipelineConfig:
     # A1 – CTC beam search
     beam_width: int = 40
     n_best: int = 25
-    blank_penalty: float = 0.0
+    blank_penalty: float = 0.693  # log(2) ≈ 0.693, matching the paper
 
     # A2 – Lexicon
     max_edit_dist: int = 1
     lexicon_beam_width: int = 5
     max_word_candidates: int = 100  # Max word-level candidates to keep
+
+    # N-gram LM (shallow fusion during lexicon segmentation + first-pass rescore)
+    ngram_order: int = 5
+    ngram_weight: float = 0.5  # weight during lexicon beam search
+    use_ngram: bool = True  # enable N-gram shallow fusion
+    lambda_ngram: float = 1.0  # N-gram weight in final rescoring
 
     # B1 – Uncertainty
     entropy_threshold: float = 1.5
@@ -155,6 +162,9 @@ class DecodePipeline:
             max_candidates_per_slot=config.max_candidates_per_slot,
         )
 
+        # N-gram LM
+        self._ngram_lm: Optional[NgramLM] = None
+
         # C – LLM (lazy-loaded)
         self._llm_scorer: Optional[LLMScorer] = None
 
@@ -162,8 +172,13 @@ class DecodePipeline:
         self._student: Optional[StudentReranker] = None
 
     def setup(self, training_sentences: List[str]):
-        """Build the lexicon from training data."""
+        """Build the lexicon and N-gram LM from training data."""
         self.lexicon.build_from_sentences(training_sentences)
+
+        # Train N-gram LM from training sentences
+        if self.config.use_ngram:
+            self._ngram_lm = NgramLM(order=self.config.ngram_order)
+            self._ngram_lm.train(training_sentences)
 
     def _get_llm(self) -> LLMScorer:
         if self._llm_scorer is None:
@@ -216,7 +231,7 @@ class DecodePipeline:
             result.phoneme_log_prob = hyps[0].log_prob
         result.ctc_decode_time = time.time() - t_ctc
 
-        # ---- A2: Phoneme → Word ----
+        # ---- A2: Phoneme → Word (with optional N-gram shallow fusion) ----
         t_lex = time.time()
         word_hyps: List[Tuple[List[str], float]] = []
         T_frames = (
@@ -224,7 +239,10 @@ class DecodePipeline:
         )
         for hyp in hyps:
             w_results = self.lexicon.phonemes_to_words(
-                hyp.phoneme_ids, beam_width=self.config.lexicon_beam_width
+                hyp.phoneme_ids,
+                beam_width=self.config.lexicon_beam_width,
+                ngram_lm=self._ngram_lm,
+                ngram_weight=self.config.ngram_weight,
             )
             # Normalize CTC log-prob per frame so it's comparable to
             # per-token LLM scores (both will be in ~ [-1, -10] range)
@@ -321,8 +339,7 @@ class DecodePipeline:
                 result.final_score = best_score
 
             elif self.config.decode_mode == "constrained_rescore":
-                # C1 – Constrained N-best rescoring
-                # Pre-compute LLM scores in batch for GPU efficiency.
+                # C1 – Constrained N-best rescoring with 3-weight formula
                 llm = self._get_llm()
                 slot_decoder = SlotFillingDecoder(
                     llm_score_fn=llm.score,
@@ -336,6 +353,14 @@ class DecodePipeline:
                 cand_lists = [wh[0] for wh in result.word_hypotheses[:n_cands]]
                 neural_scores = [wh[1] for wh in result.word_hypotheses[:n_cands]]
                 sentences = [" ".join(words) for words in cand_lists]
+
+                # N-gram scores (fast)
+                if self._ngram_lm is not None and self._ngram_lm.is_ready:
+                    ngram_scores = [self._ngram_lm.score_sentence(s) for s in sentences]
+                else:
+                    ngram_scores = None
+
+                # LLM scores (expensive)
                 lm_scores = llm.score_batch(sentences)
                 rescored = slot_decoder.rescore_nbest(
                     template,
@@ -343,6 +368,8 @@ class DecodePipeline:
                     neural_scores,
                     length_penalty_beta=self.config.length_penalty_beta,
                     lm_scores=lm_scores,
+                    ngram_scores=ngram_scores,
+                    lambda_ngram=self.config.lambda_ngram,
                     normalize_scores=self.config.normalize_scores,
                 )
                 if rescored:
@@ -350,9 +377,10 @@ class DecodePipeline:
                     result.final_score = rescored[0][1]
 
             elif self.config.decode_mode == "unconstrained_rescore":
-                # Two-pass LLM rescoring for better accuracy:
-                # Pass 1: batch-score all candidates
-                # Pass 2: re-score top-K with incremental scoring
+                # Three-weight rescoring: alpha*CTC + beta*ngram + (1-beta)*LLM
+                # Following Willett et al. (2023):
+                #   score(b) = alpha * log P_enc(b) + beta * log P_ngram(b)
+                #              + (1 - beta) * log P_LLM(b)
                 llm = self._get_llm()
                 n_cands = min(
                     len(result.word_hypotheses), self.config.max_word_candidates
@@ -361,70 +389,39 @@ class DecodePipeline:
                 neural_scores_list = [wh[1] for wh in result.word_hypotheses[:n_cands]]
 
                 sentences = [" ".join(words) for words in cand_lists]
+
+                # N-gram first-pass scores (fast)
+                if self._ngram_lm is not None and self._ngram_lm.is_ready:
+                    ngram_scores = [self._ngram_lm.score_sentence(s) for s in sentences]
+                else:
+                    ngram_scores = [0.0] * n_cands
+
+                # LLM second-pass scores (expensive)
                 lm_scores = llm.score_batch(sentences)
 
-                # Optionally z-score normalise
+                # Optionally z-score normalise all three score streams
                 ns_arr = np.array(neural_scores_list, dtype=np.float64)
+                ng_arr = np.array(ngram_scores, dtype=np.float64)
                 lm_arr = np.array(lm_scores, dtype=np.float64)
                 if self.config.normalize_scores and len(ns_arr) > 1:
-                    ns_std = np.std(ns_arr)
-                    lm_std = np.std(lm_arr)
-                    if ns_std > 1e-8:
-                        ns_arr = (ns_arr - np.mean(ns_arr)) / ns_std
-                    else:
-                        ns_arr = ns_arr - np.mean(ns_arr)
-                    if lm_std > 1e-8:
-                        lm_arr = (lm_arr - np.mean(lm_arr)) / lm_std
-                    else:
-                        lm_arr = lm_arr - np.mean(lm_arr)
+                    for arr in [ns_arr, ng_arr, lm_arr]:
+                        std = np.std(arr)
+                        if std > 1e-8:
+                            arr -= np.mean(arr)
+                            arr /= std
+                        else:
+                            arr -= np.mean(arr)
 
                 rescored = []
-                for words, ns, lm_score in zip(
-                    cand_lists, ns_arr.tolist(), lm_arr.tolist()
-                ):
+                for i, words in enumerate(cand_lists):
                     combined = (
-                        self.config.lambda_neural * ns
-                        + self.config.lambda_lm * lm_score
+                        self.config.lambda_neural * ns_arr[i]
+                        + self.config.lambda_ngram * ng_arr[i]
+                        + self.config.lambda_lm * lm_arr[i]
                         + self.config.length_penalty_beta * len(words)
                     )
                     rescored.append((words, combined))
                 rescored.sort(key=lambda x: x[1], reverse=True)
-
-                # Pass 2: re-score top-K with incremental LLM scoring
-                # for finer discrimination among finalists
-                top_k = self.config.two_pass_top_k
-                if top_k > 0 and len(rescored) > 1:
-                    top_k = min(top_k, len(rescored))
-                    top_candidates = rescored[:top_k]
-                    # Find the longest common prefix among top-K
-                    prefix_words = _longest_common_prefix(
-                        [tc[0] for tc in top_candidates]
-                    )
-                    prefix_str = " ".join(prefix_words)
-                    if prefix_words:
-                        continuations = [
-                            " ".join(tc[0][len(prefix_words) :])
-                            for tc in top_candidates
-                        ]
-                        incr_scores = llm.score_incremental(prefix_str, continuations)
-                        # Re-rank using incremental scores (more accurate)
-                        # The neural scores for these candidates come from
-                        # their original indices
-                        top_rescored = []
-                        for j, ((words, _old_combined), incr_lm) in enumerate(
-                            zip(top_candidates, incr_scores)
-                        ):
-                            # Find original neural score
-                            idx = cand_lists.index(words) if words in cand_lists else j
-                            ns_j = ns_arr[idx] if idx < len(ns_arr) else 0.0
-                            combined = (
-                                self.config.lambda_neural * ns_j
-                                + self.config.lambda_lm * incr_lm
-                                + self.config.length_penalty_beta * len(words)
-                            )
-                            top_rescored.append((words, combined))
-                        top_rescored.sort(key=lambda x: x[1], reverse=True)
-                        rescored = top_rescored + rescored[top_k:]
 
                 if rescored:
                     result.final_words = rescored[0][0]

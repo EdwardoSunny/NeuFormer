@@ -327,6 +327,8 @@ class PronunciationLexicon:
         self,
         phoneme_ids: List[int],
         beam_width: int = 10,
+        ngram_lm=None,
+        ngram_weight: float = 0.0,
     ) -> List[Tuple[List[str], float]]:
         """
         Convert a phoneme ID sequence into word-level hypotheses.
@@ -338,8 +340,21 @@ class PronunciationLexicon:
         tokens present), uses DP-based lexicon segmentation over the
         full phoneme string.
 
+        Parameters
+        ----------
+        phoneme_ids : list of int
+        beam_width : int
+        ngram_lm : NgramLM or None
+            If provided, N-gram scores are incorporated during word
+            selection to produce more diverse, linguistically plausible
+            candidates (shallow fusion).
+        ngram_weight : float
+            Weight for N-gram log-prob during beam search.  Higher values
+            produce more language-model-biased candidates.  Typical range:
+            0.3-1.0.  The paper uses alpha=0.8.
+
         Returns a list of (word_list, score) tuples sorted best-first.
-        Lower score = fewer edits = better.
+        Lower score = fewer edits = better (negative ngram bonus lowers score).
         """
         # Filter out blanks
         cleaned = [p for p in phoneme_ids if p != BLANK_IDX]
@@ -351,7 +366,9 @@ class PronunciationLexicon:
 
         if chunks:
             # SIL-based segmentation (primary path)
-            return self._segment_from_chunks(chunks, beam_width)
+            return self._segment_from_chunks(
+                chunks, beam_width, ngram_lm=ngram_lm, ngram_weight=ngram_weight
+            )
         else:
             # Fallback: DP-based lexicon segmentation without SIL
             return self._dp_segment(cleaned, beam_width)
@@ -360,8 +377,24 @@ class PronunciationLexicon:
         self,
         chunks: List[List[int]],
         beam_width: int,
+        ngram_lm=None,
+        ngram_weight: float = 0.0,
     ) -> List[Tuple[List[str], float]]:
-        """Segment pre-split phoneme chunks into words via beam search."""
+        """
+        Segment pre-split phoneme chunks into words via beam search.
+
+        When an N-gram LM is provided, each candidate word is scored
+        using the N-gram probability conditioned on the preceding words
+        in the beam.  This produces diverse, linguistically plausible
+        word-level N-best lists (shallow fusion).
+
+        The combined score for each word is:
+            edit_cost - ngram_weight * log10_P(word | context)
+
+        Since edit_cost is non-negative and log10_P is negative,
+        subtracting a weighted negative log-prob *reduces* the score
+        for linguistically plausible words (lower = better).
+        """
         chunk_candidates: List[List[Tuple[str, float]]] = []
         for chunk in chunks:
             candidates = self._find_word_candidates(chunk)
@@ -370,6 +403,8 @@ class PronunciationLexicon:
                 candidates = [("<unk>", float(len(chunk)))]
             chunk_candidates.append(candidates)
 
+        use_ngram = ngram_lm is not None and ngram_weight > 0 and ngram_lm.is_ready
+
         # Beam search over word sequence combinations
         beams: List[Tuple[List[str], float]] = [([], 0.0)]
 
@@ -377,7 +412,19 @@ class PronunciationLexicon:
             new_beams: List[Tuple[List[str], float]] = []
             for words, score in beams:
                 for cand_word, cand_cost in candidates:
-                    new_beams.append((words + [cand_word], score + cand_cost))
+                    if use_ngram:
+                        # N-gram score: log10 P(word | context)
+                        # Context is the preceding words (with <s> for start)
+                        context = ["<s>"] + words if not words else words
+                        ngram_logp = ngram_lm.score_word(cand_word, context)
+                        # Combined: lower is better
+                        # edit_cost >= 0, ngram_logp <= 0
+                        # Subtracting ngram_weight * ngram_logp adds a
+                        # positive bonus for high-prob words
+                        combined_cost = cand_cost - ngram_weight * ngram_logp
+                    else:
+                        combined_cost = cand_cost
+                    new_beams.append((words + [cand_word], score + combined_cost))
             # Prune
             new_beams.sort(key=lambda x: x[1])
             beams = new_beams[:beam_width]

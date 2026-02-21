@@ -353,21 +353,16 @@ class SlotFillingDecoder:
         neural_scores: List[float],
         length_penalty_beta: float = 0.0,
         lm_scores: Optional[List[float]] = None,
+        ngram_scores: Optional[List[float]] = None,
+        lambda_ngram: float = 0.0,
         normalize_scores: bool = False,
     ) -> List[Tuple[List[str], float]]:
         """
         C1-style constrained N-best rescoring.
 
-        **Constraint adherence**: The output is always one of the input
-        candidates verbatim, so transcript-level adherence is 100% by
-        construction.
-
-        **Locked-slot penalty**: Uses edit-distance alignment between
-        the template's reference word sequence and each candidate to
-        correctly identify which candidate words correspond to which
-        template slots, even when candidates have different lengths
-        (insertions/deletions).  Penalty is applied only when a locked
-        slot's aligned candidate word differs from the locked word.
+        **Three-weight scoring**: Following Willett et al. (2023):
+            score = lambda_neural * CTC + lambda_ngram * ngram
+                  + lambda_lm * LLM - constraint_penalty + length_bonus
 
         Parameters
         ----------
@@ -377,12 +372,13 @@ class SlotFillingDecoder:
         length_penalty_beta : float
             Length normalisation term.
         lm_scores : list of float or None
-            Pre-computed LLM scores for each candidate.  If None,
-            ``self.llm_score_fn`` is called per candidate (slow).
+            Pre-computed LLM scores for each candidate.
+        ngram_scores : list of float or None
+            Pre-computed N-gram scores for each candidate.
+        lambda_ngram : float
+            Weight for N-gram scores.
         normalize_scores : bool
-            If True, z-score normalise neural and LM scores across the
-            N-best list before combining.  This puts both score streams
-            on the same scale regardless of their raw dynamic range.
+            If True, z-score normalise all score streams.
 
         Returns
         -------
@@ -404,25 +400,29 @@ class SlotFillingDecoder:
         if lm_scores is None:
             lm_scores = [self.llm_score_fn(" ".join(words)) for words in candidates]
 
-        # Optionally z-score normalise both score streams
+        # Score arrays
         ns_arr = np.array(neural_scores, dtype=np.float64)
         lm_arr = np.array(lm_scores, dtype=np.float64)
+        ng_arr = (
+            np.array(ngram_scores, dtype=np.float64)
+            if ngram_scores is not None
+            else np.zeros(len(candidates), dtype=np.float64)
+        )
 
         if normalize_scores and len(ns_arr) > 1:
-            ns_std = np.std(ns_arr)
-            lm_std = np.std(lm_arr)
-            if ns_std > 1e-8:
-                ns_arr = (ns_arr - np.mean(ns_arr)) / ns_std
-            else:
-                ns_arr = ns_arr - np.mean(ns_arr)
-            if lm_std > 1e-8:
-                lm_arr = (lm_arr - np.mean(lm_arr)) / lm_std
-            else:
-                lm_arr = lm_arr - np.mean(lm_arr)
+            for arr in [ns_arr, lm_arr, ng_arr]:
+                std = np.std(arr)
+                if std > 1e-8:
+                    arr -= np.mean(arr)
+                    arr /= std
+                else:
+                    arr -= np.mean(arr)
 
-        for i, (words, ns, lm_score) in enumerate(
-            zip(candidates, ns_arr.tolist(), lm_arr.tolist())
-        ):
+        for i, words in enumerate(candidates):
+            ns = ns_arr[i]
+            lm_score = lm_arr[i]
+            ng_score = ng_arr[i]
+
             # Constraint penalty via edit-distance alignment
             constraint_penalty = 0.0
             if template_words and words:
@@ -440,6 +440,7 @@ class SlotFillingDecoder:
 
             combined = (
                 self.lambda_neural * ns
+                + lambda_ngram * ng_score
                 + self.lambda_lm * lm_score
                 - constraint_penalty
                 + length_bonus

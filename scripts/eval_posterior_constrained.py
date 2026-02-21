@@ -364,6 +364,23 @@ def main():
         help="Confidence threshold for locking slots",
     )
     parser.add_argument(
+        "--lambda_ngram", type=float, default=1.0, help="N-gram score weight"
+    )
+    parser.add_argument(
+        "--ngram_weight",
+        type=float,
+        default=0.5,
+        help="N-gram weight during lexicon beam search (shallow fusion)",
+    )
+    parser.add_argument(
+        "--ngram_order", type=int, default=5, help="N-gram order (3 or 5)"
+    )
+    parser.add_argument(
+        "--no_ngram",
+        action="store_true",
+        help="Disable N-gram LM entirely",
+    )
+    parser.add_argument(
         "--output", type=str, default=None, help="Output file for results"
     )
     parser.add_argument(
@@ -419,6 +436,10 @@ def main():
         high_confidence_threshold=input_args.high_confidence_threshold,
         normalize_scores=input_args.normalize_scores,
         two_pass_top_k=input_args.two_pass_top_k,
+        use_ngram=not input_args.no_ngram,
+        ngram_order=input_args.ngram_order,
+        ngram_weight=input_args.ngram_weight,
+        lambda_ngram=input_args.lambda_ngram,
     )
 
     pipeline = DecodePipeline(config)
