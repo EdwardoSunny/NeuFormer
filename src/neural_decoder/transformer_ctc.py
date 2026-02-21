@@ -148,11 +148,14 @@ class AutoEncoderEncoder(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
+        # IMPORTANT: Sequential indices must stay as net.0, net.1, net.2 for
+        # backward compatibility with v1 checkpoints (Linear, ReLU, Linear).
+        # Dropout goes AFTER the second Linear so v1 keys still match.
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, latent_dim),
+            nn.Linear(input_dim, hidden_dim),  # net.0 (matches v1)
+            nn.ReLU(inplace=True),  # net.1 (matches v1)
+            nn.Linear(hidden_dim, latent_dim),  # net.2 (matches v1)
+            nn.Dropout(dropout),  # net.3 (new, missing keys OK)
         )
         self.ln = nn.LayerNorm(latent_dim)
         # Residual projection if dims don't match
