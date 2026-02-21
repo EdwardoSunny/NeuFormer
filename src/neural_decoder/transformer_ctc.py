@@ -136,8 +136,12 @@ class NeuralFrontend(nn.Module):
 
 class AutoEncoderEncoder(nn.Module):
     """
-    MLP bottleneck projection (MiSTR-style) with residual connection
-    and LayerNorm for better gradient flow.
+    MLP bottleneck projection (MiSTR-style).
+
+    When ``use_residual=True`` (v2), adds a residual connection and
+    LayerNorm for better gradient flow.  When ``False`` (v1 default),
+    behaves identically to the original implementation so that v1
+    checkpoints load and produce the same output.
     """
 
     def __init__(
@@ -145,28 +149,41 @@ class AutoEncoderEncoder(nn.Module):
         input_dim: int,
         latent_dim: int,
         hidden_dim: int = 128,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
+        use_residual: bool = False,
     ):
         super().__init__()
-        # IMPORTANT: Sequential indices must stay as net.0, net.1, net.2 for
-        # backward compatibility with v1 checkpoints (Linear, ReLU, Linear).
-        # Dropout goes AFTER the second Linear so v1 keys still match.
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),  # net.0 (matches v1)
-            nn.ReLU(inplace=True),  # net.1 (matches v1)
-            nn.Linear(hidden_dim, latent_dim),  # net.2 (matches v1)
-            nn.Dropout(dropout),  # net.3 (new, missing keys OK)
-        )
-        self.ln = nn.LayerNorm(latent_dim)
-        # Residual projection if dims don't match
-        self.residual_proj = (
-            nn.Linear(input_dim, latent_dim)
-            if input_dim != latent_dim
-            else nn.Identity()
-        )
+        self.use_residual = use_residual
+
+        if dropout > 0:
+            # v2: add Dropout after second Linear (keeps net.0/net.2 indices)
+            self.net = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),  # net.0
+                nn.ReLU(inplace=True),  # net.1
+                nn.Linear(hidden_dim, latent_dim),  # net.2
+                nn.Dropout(dropout),  # net.3
+            )
+        else:
+            # v1 compatible: no Dropout
+            self.net = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),  # net.0
+                nn.ReLU(inplace=True),  # net.1
+                nn.Linear(hidden_dim, latent_dim),  # net.2
+            )
+
+        if use_residual:
+            self.ln = nn.LayerNorm(latent_dim)
+            self.residual_proj = (
+                nn.Linear(input_dim, latent_dim)
+                if input_dim != latent_dim
+                else nn.Identity()
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.ln(self.residual_proj(x) + self.net(x))
+        out = self.net(x)
+        if self.use_residual:
+            out = self.ln(self.residual_proj(x) + out)
+        return out
 
 
 class ConformerConvModule(nn.Module):
@@ -399,6 +416,7 @@ class NeuralTransformerCTCModel(nn.Module):
         spec_augment_freq_mask: int = 100,
         spec_augment_time_mask: int = 40,
         drop_path_prob: float = 0.1,
+        autoencoder_residual: bool = False,
         device: str = "cuda",
     ):
         super().__init__()
@@ -419,12 +437,15 @@ class NeuralTransformerCTCModel(nn.Module):
             dropout=transformer_dropout,
         )
 
-        # Autoencoder bottleneck (with residual + LayerNorm + dropout)
+        # Autoencoder bottleneck
+        # v1: plain MLP (no residual, no dropout)
+        # v2: residual + LayerNorm + dropout (set autoencoder_residual=True)
         self.encoder = AutoEncoderEncoder(
             input_dim=frontend_dim,
             latent_dim=latent_dim,
             hidden_dim=autoencoder_hidden_dim,
-            dropout=transformer_dropout,
+            dropout=transformer_dropout if autoencoder_residual else 0.0,
+            use_residual=autoencoder_residual,
         )
 
         # SpecAugment (applied after encoder, before positional encoding)

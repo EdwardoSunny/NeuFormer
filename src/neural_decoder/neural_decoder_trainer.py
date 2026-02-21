@@ -104,6 +104,7 @@ def trainModel(args):
             spec_augment_freq_mask=args.get("spec_augment_freq_mask", 100),
             spec_augment_time_mask=args.get("spec_augment_time_mask", 40),
             drop_path_prob=args.get("drop_path_prob", 0.1),
+            autoencoder_residual=args.get("autoencoder_residual", False),
             device=device,
         ).to(device)
     else:
@@ -499,6 +500,7 @@ def loadConformerModel(modelDir, nInputLayers=24, device="cuda"):
         conformer_conv_kernel=args.get("conformer_conv_kernel", 31),
         use_spec_augment=False,  # Disabled during inference
         drop_path_prob=0.0,  # Disabled during inference
+        autoencoder_residual=args.get("autoencoder_residual", False),
         device=device,
     ).to(device)
 

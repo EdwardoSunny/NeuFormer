@@ -76,6 +76,9 @@ args["spec_augment_time_mask"] = 40
 # Intermediate CTC
 args["interctc_weight"] = 0.3
 
+# v2 architecture features
+args["autoencoder_residual"] = True  # Residual + LayerNorm in AutoEncoder
+
 # New v2 training features
 args["use_amp"] = True  # Mixed precision for ~2x speedup
 args["use_ema"] = True  # EMA of model weights

@@ -68,19 +68,13 @@ def load_conformer_model(model_dir: str, n_days: int = 24, device: str = "cuda")
         conformer_conv_kernel=args.get("conformer_conv_kernel", 31),
         use_spec_augment=False,  # Disable during eval
         drop_path_prob=0.0,  # Disable during eval
+        autoencoder_residual=args.get("autoencoder_residual", False),
         device=device,
     ).to(device)
 
     weights_path = os.path.join(model_dir, "modelWeights")
     state_dict = torch.load(weights_path, map_location=device)
-    # Use strict=False for cross-version compatibility (v2 adds new params)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing:
-        print(
-            f"  Note: {len(missing)} new params initialized from scratch (architecture upgrade)"
-        )
-    if unexpected:
-        print(f"  Warning: {len(unexpected)} unexpected keys in checkpoint")
+    model.load_state_dict(state_dict)
     model.eval()
     return model, args
 
