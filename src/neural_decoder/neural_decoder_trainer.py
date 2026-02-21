@@ -160,12 +160,15 @@ def trainModel(args):
         )
         warmup_steps = int(args.get("warmup_steps", 0))
         total_steps = args["nBatch"]
+        # Cosine schedule decays to lrEnd (not zero) for stable late training
+        lr_min_ratio = args.get("lrEnd", 0.0) / max(args["lrStart"], 1e-10)
 
         def lr_lambda(step):
             if warmup_steps > 0 and step < warmup_steps:
                 return float(step + 1) / float(max(1, warmup_steps))
             progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return lr_min_ratio + (1.0 - lr_min_ratio) * cosine
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     else:
@@ -184,13 +187,34 @@ def trainModel(args):
         )
 
     # --train--
+    # EMA (Exponential Moving Average) of model weights for better generalization
+    use_ema = args.get("use_ema", False)
+    ema_decay = args.get("ema_decay", 0.999)
+    ema_state = None
+    if use_ema:
+        ema_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+    # AMP (Automatic Mixed Precision) for faster training
+    use_amp = args.get("use_amp", False)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
     testLoss = []
     testCER = []
     startTime = time.time()
+
+    # Fix: use a proper iterator that cycles through the full dataset
+    # instead of next(iter(trainLoader)) which re-creates iterator every batch
+    train_iter = iter(trainLoader)
+
     for batch in range(args["nBatch"]):
         model.train()
 
-        X, y, X_len, y_len, dayIdx = next(iter(trainLoader))
+        try:
+            X, y, X_len, y_len, dayIdx = next(train_iter)
+        except StopIteration:
+            train_iter = iter(trainLoader)
+            X, y, X_len, y_len, dayIdx = next(train_iter)
+
         X, y, X_len, y_len, dayIdx = (
             X.to(device),
             y.to(device),
@@ -209,66 +233,81 @@ def trainModel(args):
                 * args["constantOffsetSD"]
             )
 
-        # Compute prediction error
+        # Compute prediction error (with optional AMP)
         inter_log_probs = None
-        if args.get("model_type", "gru_baseline") == "transformer_ctc":
-            log_probs, out_lens, inter_log_probs = model(X, dayIdx, X_len)
-        else:
-            pred = model.forward(X, dayIdx)
-            out_lens = ((X_len - model.kernelLen) / model.strideLen).to(torch.int32)
-            log_probs = pred.log_softmax(2).permute(1, 0, 2)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            if args.get("model_type", "gru_baseline") == "transformer_ctc":
+                log_probs, out_lens, inter_log_probs = model(X, dayIdx, X_len)
+            else:
+                pred = model.forward(X, dayIdx)
+                out_lens = ((X_len - model.kernelLen) / model.strideLen).to(torch.int32)
+                log_probs = pred.log_softmax(2).permute(1, 0, 2)
 
-        # Main CTC loss
-        loss = loss_ctc(
-            log_probs,
-            y,
-            out_lens,
-            y_len,
-        )
+            # CTC loss needs float32 log_probs
+            log_probs_f32 = log_probs.float()
 
-        # Add intermediate CTC loss if available
-        interctc_weight = args.get("interctc_weight", 0.3)
-        if inter_log_probs is not None:
-            inter_loss = loss_ctc(
-                inter_log_probs,
+            # Main CTC loss
+            loss = loss_ctc(
+                log_probs_f32,
                 y,
                 out_lens,
                 y_len,
             )
+
+            # Add intermediate CTC loss if available
+            interctc_weight = args.get("interctc_weight", 0.3)
+            if inter_log_probs is not None:
+                inter_log_probs_f32 = inter_log_probs.float()
+                inter_loss = loss_ctc(
+                    inter_log_probs_f32,
+                    y,
+                    out_lens,
+                    y_len,
+                )
+                if label_smoothing > 0:
+                    inter_loss = torch.mean(inter_loss)
+                else:
+                    inter_loss = torch.sum(inter_loss)
+
+            # Apply label smoothing and/or InterCTC
             if label_smoothing > 0:
-                inter_loss = torch.mean(inter_loss)
+                ctc_loss = torch.mean(loss)
+                # Uniform distribution for label smoothing
+                uniform_dist = torch.full_like(log_probs_f32, -math.log(n_classes))
+                kl_div = torch.nn.functional.kl_div(
+                    log_probs_f32, uniform_dist, reduction="batchmean", log_target=True
+                )
+                main_loss = (1 - label_smoothing) * ctc_loss + label_smoothing * kl_div
             else:
-                inter_loss = torch.sum(inter_loss)
+                main_loss = torch.sum(loss)
 
-        # Apply label smoothing and/or InterCTC
-        if label_smoothing > 0:
-            ctc_loss = torch.mean(loss)
-            # Uniform distribution for label smoothing
-            uniform_dist = torch.full_like(log_probs, -math.log(n_classes))
-            kl_div = torch.nn.functional.kl_div(
-                log_probs, uniform_dist, reduction="batchmean", log_target=True
-            )
-            main_loss = (1 - label_smoothing) * ctc_loss + label_smoothing * kl_div
-        else:
-            main_loss = torch.sum(loss)
+            # Combine main loss with intermediate CTC loss
+            if inter_log_probs is not None:
+                loss = (
+                    1.0 - interctc_weight
+                ) * main_loss + interctc_weight * inter_loss
+            else:
+                loss = main_loss
 
-        # Combine main loss with intermediate CTC loss
-        if inter_log_probs is not None:
-            loss = (1.0 - interctc_weight) * main_loss + interctc_weight * inter_loss
-        else:
-            loss = main_loss
-
-        # Backpropagation
+        # Backpropagation with AMP scaling
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
 
         # Gradient clipping (especially important for Conformer)
         grad_norm = None
         if args.get("model_type", "gru_baseline") == "transformer_ctc":
+            scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         scheduler.step()
+
+        # Update EMA
+        if use_ema and ema_state is not None:
+            with torch.no_grad():
+                for k, v in model.state_dict().items():
+                    ema_state[k].mul_(ema_decay).add_(v, alpha=1.0 - ema_decay)
 
         # Log training metrics every step
         current_lr = optimizer.param_groups[0]["lr"]
@@ -289,6 +328,11 @@ def trainModel(args):
 
         # Eval
         if batch % 100 == 0:
+            # Swap in EMA weights for evaluation if enabled
+            if use_ema and ema_state is not None:
+                original_state = {k: v.clone() for k, v in model.state_dict().items()}
+                model.load_state_dict(ema_state)
+
             with torch.no_grad():
                 model.eval()
                 allLoss = []
@@ -379,6 +423,10 @@ def trainModel(args):
 
             with open(args["outputDir"] + "/trainingStats", "wb") as file:
                 pickle.dump(tStats, file)
+
+            # Restore original (non-EMA) weights for continued training
+            if use_ema and ema_state is not None:
+                model.load_state_dict(original_state)
 
     # Log final summary
     final_cer = testCER[-1] if len(testCER) > 0 else float("inf")

@@ -37,6 +37,7 @@ from neural_decoder.evaluation import (
     evaluate_wer,
     evaluate_cer,
     evaluate_per,
+    oracle_wer,
     constraint_adherence,
     transcript_adherence,
     wer_by_confidence_bucket,
@@ -71,7 +72,15 @@ def load_conformer_model(model_dir: str, n_days: int = 24, device: str = "cuda")
     ).to(device)
 
     weights_path = os.path.join(model_dir, "modelWeights")
-    model.load_state_dict(torch.load(weights_path, map_location=device))
+    state_dict = torch.load(weights_path, map_location=device)
+    # Use strict=False for cross-version compatibility (v2 adds new params)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(
+            f"  Note: {len(missing)} new params initialized from scratch (architecture upgrade)"
+        )
+    if unexpected:
+        print(f"  Warning: {len(unexpected)} unexpected keys in checkpoint")
     model.eval()
     return model, args
 
@@ -244,6 +253,7 @@ def run_decode_mode(
     wer = evaluate_wer(all_pred_words, all_ref_words)
     cer = evaluate_cer(all_pred_sentences, all_ref_sentences)
     per = evaluate_per(all_pred_phonemes, all_ref_phonemes)
+    ower = oracle_wer(all_candidate_sets, all_ref_words)
     ca = constraint_adherence(all_pred_words, all_candidate_sets)
     ta = transcript_adherence(all_pred_words, all_candidate_sets)
 
@@ -276,6 +286,7 @@ def run_decode_mode(
         hallucination_rate_transcript=1.0 - ta,
         runtime_seconds=elapsed,
         confidence_breakdown=conf_breakdown,
+        extra={"oracle_wer": ower},
     )
 
 
@@ -390,8 +401,9 @@ def main():
             config.decode_mode = mode
             report = run_decode_mode(utterances, pipeline, name, config)
             reports.append(report)
+            ow = report.extra.get("oracle_wer", float("nan"))
             print(
-                f"    WER={report.wer:.4f}  CER={report.cer:.4f}  "
+                f"    WER={report.wer:.4f}  Oracle={ow:.4f}  CER={report.cer:.4f}  "
                 f"PER={report.per:.4f}  Time={report.runtime_seconds:.1f}s"
             )
 

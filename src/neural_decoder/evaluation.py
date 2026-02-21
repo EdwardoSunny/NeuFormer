@@ -97,6 +97,41 @@ def evaluate_per(
     return total_edits / max(total_ref, 1)
 
 
+def oracle_wer(
+    candidate_sets: List[List[List[str]]],
+    references: List[List[str]],
+) -> float:
+    """
+    Oracle N-best WER: for each utterance, pick the candidate from the
+    N-best list that minimizes WER against the reference.
+
+    This measures the *ceiling* of any rescoring approach — if the
+    correct words aren't in the N-best list, no rescorer can fix it.
+
+    Parameters
+    ----------
+    candidate_sets : list of N-best lists, each a list of word-lists
+    references : list of reference word lists
+
+    Returns
+    -------
+    float  Oracle WER in [0, ∞)
+    """
+    total_edits = 0
+    total_ref = 0
+    for cands, ref in zip(candidate_sets, references):
+        if not ref:
+            continue
+        best_edits = edit_distance(ref, cands[0]) if cands else len(ref)
+        for cand in cands[1:]:
+            d = edit_distance(ref, cand)
+            if d < best_edits:
+                best_edits = d
+        total_edits += best_edits
+        total_ref += len(ref)
+    return total_edits / max(total_ref, 1)
+
+
 def constraint_adherence(
     predictions: List[List[str]],
     candidate_sets: List[List[List[str]]],

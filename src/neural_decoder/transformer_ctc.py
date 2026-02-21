@@ -8,12 +8,13 @@ from torch.nn import functional as F
 
 class DropPath(nn.Module):
     """Stochastic Depth (DropPath) regularization."""
+
     def __init__(self, drop_prob=0.0):
         super(DropPath, self).__init__()
         self.drop_prob = drop_prob
 
     def forward(self, x):
-        if self.drop_prob == 0. or not self.training:
+        if self.drop_prob == 0.0 or not self.training:
             return x
         keep_prob = 1 - self.drop_prob
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
@@ -71,8 +72,10 @@ class NeuralFrontend(nn.Module):
         # Gaussian smoothing (like GRU preprocessing)
         if gaussian_smooth_width > 0:
             kernel_size = int(gaussian_smooth_width * 4) + 1
-            gaussian_kernel = self._make_gaussian_kernel(kernel_size, gaussian_smooth_width)
-            self.register_buffer('gaussian_kernel', gaussian_kernel.view(1, 1, -1))
+            gaussian_kernel = self._make_gaussian_kernel(
+                kernel_size, gaussian_smooth_width
+            )
+            self.register_buffer("gaussian_kernel", gaussian_kernel.view(1, 1, -1))
             self.gaussian_padding = kernel_size // 2
         else:
             self.gaussian_kernel = None
@@ -80,12 +83,13 @@ class NeuralFrontend(nn.Module):
         # Strided temporal convolution (like GRU's unfold operation)
         if temporal_kernel > 0:
             self.temporal_conv = nn.Conv1d(
-                n_channels, n_channels,
+                n_channels,
+                n_channels,
                 kernel_size=temporal_kernel,
                 stride=temporal_stride,
                 padding=0,  # No padding to match GRU's unfold behavior
                 groups=n_channels,
-                bias=False
+                bias=False,
             )
             nn.init.constant_(self.temporal_conv.weight, 1.0 / temporal_kernel)
         else:
@@ -99,7 +103,7 @@ class NeuralFrontend(nn.Module):
     def _make_gaussian_kernel(self, kernel_size: int, sigma: float) -> torch.Tensor:
         """Create 1D Gaussian kernel for smoothing"""
         x = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2
-        gauss = torch.exp(-x.pow(2) / (2 * sigma ** 2))
+        gauss = torch.exp(-x.pow(2) / (2 * sigma**2))
         return gauss / gauss.sum()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -111,7 +115,9 @@ class NeuralFrontend(nn.Module):
         if self.gaussian_kernel is not None:
             x_t = x.transpose(1, 2)  # [B, C, T]
             kernel = self.gaussian_kernel.repeat(self.n_channels, 1, 1)
-            x_smooth = F.conv1d(x_t, kernel, padding=self.gaussian_padding, groups=self.n_channels)
+            x_smooth = F.conv1d(
+                x_t, kernel, padding=self.gaussian_padding, groups=self.n_channels
+            )
             x = x_smooth.transpose(1, 2)
 
         # Apply strided temporal convolution
@@ -130,25 +136,43 @@ class NeuralFrontend(nn.Module):
 
 class AutoEncoderEncoder(nn.Module):
     """
-    MLP bottleneck projection (MiSTR-style).
+    MLP bottleneck projection (MiSTR-style) with residual connection
+    and LayerNorm for better gradient flow.
     """
 
-    def __init__(self, input_dim: int, latent_dim: int, hidden_dim: int = 128):
+    def __init__(
+        self,
+        input_dim: int,
+        latent_dim: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, latent_dim),
+        )
+        self.ln = nn.LayerNorm(latent_dim)
+        # Residual projection if dims don't match
+        self.residual_proj = (
+            nn.Linear(input_dim, latent_dim)
+            if input_dim != latent_dim
+            else nn.Identity()
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        return self.ln(self.residual_proj(x) + self.net(x))
 
 
 class ConformerConvModule(nn.Module):
     """
     Conformer convolution module: provides local pattern modeling.
+    Now returns the residual-free output so DropPath can be applied
+    by the parent ConformerBlock (consistent with FF and attention).
     """
+
     def __init__(self, d_model: int, kernel_size: int = 31, dropout: float = 0.1):
         super().__init__()
         self.ln = nn.LayerNorm(d_model)
@@ -158,7 +182,8 @@ class ConformerConvModule(nn.Module):
         self.glu = nn.GLU(dim=-1)
         # Depthwise conv
         self.dw_conv = nn.Conv1d(
-            d_model, d_model,
+            d_model,
+            d_model,
             kernel_size=kernel_size,
             padding=kernel_size // 2,
             groups=d_model,
@@ -172,23 +197,23 @@ class ConformerConvModule(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: [B, T, D]
-        returns: [B, T, D]
+        returns: [B, T, D] — the conv module output WITHOUT residual addition.
+            The parent block adds the residual with DropPath.
         """
-        residual = x
-        x = self.ln(x)
-        x = self.pw_conv1(x)  # [B, T, 2D]
-        x = self.glu(x)  # [B, T, D]
+        out = self.ln(x)
+        out = self.pw_conv1(out)  # [B, T, 2D]
+        out = self.glu(out)  # [B, T, D]
 
         # Depthwise conv requires [B, D, T]
-        x = x.transpose(1, 2)
-        x = self.dw_conv(x)
-        x = x.transpose(1, 2)
+        out = out.transpose(1, 2)
+        out = self.dw_conv(out)
+        out = out.transpose(1, 2)
 
-        x = self.ln_conv(x)
-        x = self.activation(x)
-        x = self.pw_conv2(x)
-        x = self.dropout(x)
-        return residual + x
+        out = self.ln_conv(out)
+        out = self.activation(out)
+        out = self.pw_conv2(out)
+        out = self.dropout(out)
+        return out
 
 
 class ConformerBlock(nn.Module):
@@ -196,6 +221,7 @@ class ConformerBlock(nn.Module):
     Conformer block: FF + Attention + Conv + FF
     Half-step residual connections on feed-forward modules.
     """
+
     def __init__(
         self,
         d_model: int,
@@ -218,7 +244,9 @@ class ConformerBlock(nn.Module):
 
         # Multi-head self-attention
         self.ln_attn = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=True
+        )
         self.dropout_attn = nn.Dropout(dropout)
 
         # Convolution module
@@ -239,7 +267,9 @@ class ConformerBlock(nn.Module):
         # Stochastic Depth
         self.drop_path = DropPath(drop_path_prob)
 
-    def forward(self, x: torch.Tensor, src_key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, src_key_padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         x: [B, T, D]
         src_key_padding_mask: [B, T] - True for padding positions
@@ -250,11 +280,13 @@ class ConformerBlock(nn.Module):
 
         # Multi-head attention with DropPath
         x_attn = self.ln_attn(x)
-        attn_out, _ = self.attn(x_attn, x_attn, x_attn, key_padding_mask=src_key_padding_mask)
+        attn_out, _ = self.attn(
+            x_attn, x_attn, x_attn, key_padding_mask=src_key_padding_mask
+        )
         x = x + self.drop_path(self.dropout_attn(attn_out))
 
-        # Convolution module (already has residual inside)
-        x = self.conv_module(x)
+        # Convolution module with DropPath (consistent with FF and attention)
+        x = x + self.drop_path(self.conv_module(x))
 
         # Second FF module (half-step) with DropPath
         x = x + self.drop_path(0.5 * self.ff2(x))
@@ -269,7 +301,13 @@ class SpecAugment(nn.Module):
     Forces the model to rely on global context rather than local features.
     """
 
-    def __init__(self, freq_mask_param: int = 27, time_mask_param: int = 35, num_freq_masks: int = 2, num_time_masks: int = 2):
+    def __init__(
+        self,
+        freq_mask_param: int = 27,
+        time_mask_param: int = 35,
+        num_freq_masks: int = 2,
+        num_time_masks: int = 2,
+    ):
         super().__init__()
         self.freq_mask_param = freq_mask_param
         self.time_mask_param = time_mask_param
@@ -293,7 +331,7 @@ class SpecAugment(nn.Module):
             f = min(f, F)  # Ensure we don't exceed feature dimension
             if f > 0:
                 f0 = int(torch.rand(1).item() * (F - f))
-                x[:, :, f0:f0+f] = 0
+                x[:, :, f0 : f0 + f] = 0
 
         # 2. Time Masking
         # Mask random blocks of timesteps
@@ -302,7 +340,7 @@ class SpecAugment(nn.Module):
             t = min(t, T)  # Ensure we don't exceed time dimension
             if t > 0:
                 t0 = int(torch.rand(1).item() * (T - t))
-                x[:, t0:t0+t, :] = 0
+                x[:, t0 : t0 + t, :] = 0
 
         return x
 
@@ -316,7 +354,9 @@ class PositionalEncoding(nn.Module):
         super().__init__()
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0)  # [1, max_len, d_model]
@@ -362,7 +402,9 @@ class NeuralTransformerCTCModel(nn.Module):
         self.device_name = device
 
         # Day-specific normalization
-        self.day_linear = DaySpecificLinear(n_days=n_days, dim=n_channels, init_identity=True)
+        self.day_linear = DaySpecificLinear(
+            n_days=n_days, dim=n_channels, init_identity=True
+        )
 
         # Frontend: Gaussian smooth → Temporal conv/stride → Project
         self.frontend = NeuralFrontend(
@@ -374,11 +416,12 @@ class NeuralTransformerCTCModel(nn.Module):
             dropout=transformer_dropout,
         )
 
-        # Autoencoder bottleneck
+        # Autoencoder bottleneck (with residual + LayerNorm + dropout)
         self.encoder = AutoEncoderEncoder(
             input_dim=frontend_dim,
             latent_dim=latent_dim,
-            hidden_dim=autoencoder_hidden_dim
+            hidden_dim=autoencoder_hidden_dim,
+            dropout=transformer_dropout,
         )
 
         # SpecAugment (applied after encoder, before positional encoding)
@@ -394,18 +437,25 @@ class NeuralTransformerCTCModel(nn.Module):
         # Positional encoding
         self.pos_enc = PositionalEncoding(d_model=latent_dim)
 
-        # Conformer blocks
-        self.conformer_layers = nn.ModuleList([
-            ConformerBlock(
-                d_model=latent_dim,
-                nhead=transformer_heads,
-                dim_feedforward=transformer_ff_dim,
-                dropout=transformer_dropout,
-                conv_kernel_size=conformer_conv_kernel,
-                drop_path_prob=drop_path_prob,
-            )
-            for _ in range(transformer_layers)
-        ])
+        # Conformer blocks with linearly increasing DropPath schedule
+        # (layer 0 gets 0 drop, final layer gets drop_path_prob)
+        dp_rates = [
+            drop_path_prob * i / max(transformer_layers - 1, 1)
+            for i in range(transformer_layers)
+        ]
+        self.conformer_layers = nn.ModuleList(
+            [
+                ConformerBlock(
+                    d_model=latent_dim,
+                    nhead=transformer_heads,
+                    dim_feedforward=transformer_ff_dim,
+                    dropout=transformer_dropout,
+                    conv_kernel_size=conformer_conv_kernel,
+                    drop_path_prob=dp_rates[i],
+                )
+                for i in range(transformer_layers)
+            ]
+        )
 
         # Intermediate CTC (for deep supervision)
         self.use_interctc = transformer_layers >= 6  # Only use if we have enough layers
@@ -420,21 +470,25 @@ class NeuralTransformerCTCModel(nn.Module):
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim),
             nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(latent_dim, n_classes)
+            nn.Dropout(transformer_dropout),
+            nn.Linear(latent_dim, n_classes),
         )
 
         # Store temporal parameters for length computation
         self.temporal_kernel = temporal_kernel
         self.temporal_stride = temporal_stride
 
-    def compute_output_lengths(self, input_lengths: torch.Tensor, actual_seq_len: int) -> torch.Tensor:
+    def compute_output_lengths(
+        self, input_lengths: torch.Tensor, actual_seq_len: int
+    ) -> torch.Tensor:
         """
         Compute output sequence lengths after temporal striding.
         Matches GRU formula: (length - kernel) / stride
         """
         if self.temporal_kernel > 0 and self.temporal_stride > 1:
-            output_lengths = ((input_lengths - self.temporal_kernel) / self.temporal_stride).to(torch.int32)
+            output_lengths = (
+                (input_lengths - self.temporal_kernel) / self.temporal_stride
+            ).to(torch.int32)
         else:
             output_lengths = input_lengths
         return torch.clamp(output_lengths, max=actual_seq_len)
@@ -479,10 +533,14 @@ class NeuralTransformerCTCModel(nn.Module):
         if input_lengths is not None:
             out_lengths = self.compute_output_lengths(input_lengths, actual_seq_len)
             max_len = z.size(1)
-            mask = torch.arange(max_len, device=z.device).expand(len(out_lengths), max_len) >= out_lengths.unsqueeze(1)
+            mask = torch.arange(max_len, device=z.device).expand(
+                len(out_lengths), max_len
+            ) >= out_lengths.unsqueeze(1)
             padding_mask = mask  # [B, T]
         else:
-            out_lengths = torch.full((x.size(0),), actual_seq_len, dtype=torch.int32, device=x.device)
+            out_lengths = torch.full(
+                (x.size(0),), actual_seq_len, dtype=torch.int32, device=x.device
+            )
 
         # Apply Conformer blocks with intermediate CTC
         inter_log_probs = None
@@ -492,7 +550,9 @@ class NeuralTransformerCTCModel(nn.Module):
             # Capture intermediate output for InterCTC (only during training)
             if self.use_interctc and i == self.interctc_layer - 1 and self.training:
                 inter_logits = self.inter_output(z)  # [B, T, C]
-                inter_log_probs = inter_logits.log_softmax(dim=-1).transpose(0, 1)  # [T, B, C]
+                inter_log_probs = inter_logits.log_softmax(dim=-1).transpose(
+                    0, 1
+                )  # [T, B, C]
 
         # Output projection and log softmax
         logits = self.output(z)  # [B, T, C]
