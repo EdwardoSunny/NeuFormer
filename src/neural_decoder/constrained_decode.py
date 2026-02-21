@@ -353,6 +353,7 @@ class SlotFillingDecoder:
         neural_scores: List[float],
         length_penalty_beta: float = 0.0,
         lm_scores: Optional[List[float]] = None,
+        normalize_scores: bool = False,
     ) -> List[Tuple[List[str], float]]:
         """
         C1-style constrained N-best rescoring.
@@ -378,6 +379,10 @@ class SlotFillingDecoder:
         lm_scores : list of float or None
             Pre-computed LLM scores for each candidate.  If None,
             ``self.llm_score_fn`` is called per candidate (slow).
+        normalize_scores : bool
+            If True, z-score normalise neural and LM scores across the
+            N-best list before combining.  This puts both score streams
+            on the same scale regardless of their raw dynamic range.
 
         Returns
         -------
@@ -399,7 +404,25 @@ class SlotFillingDecoder:
         if lm_scores is None:
             lm_scores = [self.llm_score_fn(" ".join(words)) for words in candidates]
 
-        for words, ns, lm_score in zip(candidates, neural_scores, lm_scores):
+        # Optionally z-score normalise both score streams
+        ns_arr = np.array(neural_scores, dtype=np.float64)
+        lm_arr = np.array(lm_scores, dtype=np.float64)
+
+        if normalize_scores and len(ns_arr) > 1:
+            ns_std = np.std(ns_arr)
+            lm_std = np.std(lm_arr)
+            if ns_std > 1e-8:
+                ns_arr = (ns_arr - np.mean(ns_arr)) / ns_std
+            else:
+                ns_arr = ns_arr - np.mean(ns_arr)
+            if lm_std > 1e-8:
+                lm_arr = (lm_arr - np.mean(lm_arr)) / lm_std
+            else:
+                lm_arr = lm_arr - np.mean(lm_arr)
+
+        for i, (words, ns, lm_score) in enumerate(
+            zip(candidates, ns_arr.tolist(), lm_arr.tolist())
+        ):
             # Constraint penalty via edit-distance alignment
             constraint_penalty = 0.0
             if template_words and words:

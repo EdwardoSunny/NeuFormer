@@ -317,14 +317,15 @@ def run_ablation_ladder(
     Format a comparison table across multiple decoding configurations.
     """
     header = (
-        f"{'Method':<35} {'WER':>8} {'CER':>8} {'PER':>8} "
+        f"{'Method':<40} {'WER':>8} {'Oracle':>8} {'CER':>8} {'PER':>8} "
         f"{'C-Adh':>8} {'T-Adh':>8} {'H-Rate':>8} "
         f"{'Time(s)':>10} {'Params':>12}"
     )
     lines = [header, "-" * len(header)]
     for r in reports:
+        ow = r.extra.get("oracle_wer", float("nan"))
         lines.append(
-            f"{r.name:<35} {r.wer:>8.4f} {r.cer:>8.4f} {r.per:>8.4f} "
+            f"{r.name:<40} {r.wer:>8.4f} {ow:>8.4f} {r.cer:>8.4f} {r.per:>8.4f} "
             f"{r.constraint_adherence:>8.4f} {r.transcript_adherence:>8.4f} "
             f"{r.hallucination_rate_transcript:>8.4f} "
             f"{r.runtime_seconds:>10.2f} {r.n_parameters:>12,}"

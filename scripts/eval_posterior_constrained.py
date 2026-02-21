@@ -69,6 +69,7 @@ def load_conformer_model(model_dir: str, n_days: int = 24, device: str = "cuda")
         use_spec_augment=False,  # Disable during eval
         drop_path_prob=0.0,  # Disable during eval
         autoencoder_residual=args.get("autoencoder_residual", False),
+        use_rope=args.get("use_rope", False),
         device=device,
     ).to(device)
 
@@ -329,7 +330,46 @@ def main():
         "--ablation", action="store_true", help="Run full ablation ladder"
     )
     parser.add_argument(
+        "--normalize_scores",
+        action="store_true",
+        default=True,
+        help="Z-score normalize neural/LM scores before combining",
+    )
+    parser.add_argument(
+        "--no_normalize_scores",
+        action="store_false",
+        dest="normalize_scores",
+        help="Disable z-score normalization",
+    )
+    parser.add_argument(
+        "--two_pass_top_k",
+        type=int,
+        default=10,
+        help="Top-K for second-pass incremental rescoring (0 to disable)",
+    )
+    parser.add_argument(
+        "--lambda_neural", type=float, default=0.5, help="Neural score weight"
+    )
+    parser.add_argument("--lambda_lm", type=float, default=1.0, help="LM score weight")
+    parser.add_argument(
+        "--gamma_constraint", type=float, default=1.0, help="Constraint penalty"
+    )
+    parser.add_argument(
+        "--length_penalty_beta", type=float, default=0.1, help="Length bonus"
+    )
+    parser.add_argument(
+        "--high_confidence_threshold",
+        type=float,
+        default=0.85,
+        help="Confidence threshold for locking slots",
+    )
+    parser.add_argument(
         "--output", type=str, default=None, help="Output file for results"
+    )
+    parser.add_argument(
+        "--fit_confidence",
+        action="store_true",
+        help="Fit learned confidence model on first 20%% of data before eval",
     )
 
     input_args = parser.parse_args()
@@ -372,11 +412,68 @@ def main():
         llm_model_name=input_args.llm_model,
         llm_device=input_args.llm_device,
         decode_mode=input_args.mode,
+        lambda_neural=input_args.lambda_neural,
+        lambda_lm=input_args.lambda_lm,
+        gamma_constraint=input_args.gamma_constraint,
+        length_penalty_beta=input_args.length_penalty_beta,
+        high_confidence_threshold=input_args.high_confidence_threshold,
+        normalize_scores=input_args.normalize_scores,
+        two_pass_top_k=input_args.two_pass_top_k,
     )
 
     pipeline = DecodePipeline(config)
     pipeline.setup(training_sentences)
     print(f"  Lexicon size: {pipeline.lexicon.size} words")
+
+    # Optionally fit learned confidence model on a dev split
+    if input_args.fit_confidence:
+        print("\nFitting learned confidence model on first 20% of data...")
+        n_dev = max(1, len(utterances) // 5)
+        dev_utts = utterances[:n_dev]
+        eval_utts = utterances[n_dev:]
+
+        # Run neural-only decoding on dev split to get word confidences
+        dev_features = []  # (min_margin, mean_entropy, blank_ratio, duration)
+        dev_correct = []  # bool
+
+        config_dev = PipelineConfig(**config.__dict__)
+        config_dev.decode_mode = "neural_only"
+        pipeline.config = config_dev
+
+        for utt in dev_utts:
+            result = pipeline.decode_utterance(utt["log_probs"], utt["length"])
+            ref_words = utt["transcription"].split() if utt["transcription"] else []
+            pred_words = result.final_words
+
+            for i, wc in enumerate(result.word_confidences):
+                duration = max(wc.end_frame - wc.start_frame, 1)
+                dev_features.append(
+                    (wc.min_margin, wc.mean_entropy, wc.blank_ratio, duration)
+                )
+                is_correct = i < len(ref_words) and wc.word == ref_words[i]
+                dev_correct.append(is_correct)
+
+        if dev_features:
+            fit_result = pipeline.uncertainty.fit_confidence_model(
+                dev_features, dev_correct
+            )
+            print(
+                f"  Fitted on {fit_result['n_samples']} words, "
+                f"accuracy={fit_result['accuracy']:.4f}"
+            )
+            if fit_result["coefficients"]:
+                print(f"  Coefficients: {fit_result['coefficients']}")
+                print(f"  Intercept: {fit_result['intercept']:.4f}")
+        else:
+            print("  No dev data available for fitting")
+            eval_utts = utterances  # Use all data
+
+        # Use remaining data for evaluation
+        utterances = eval_utts
+        print(f"  Evaluating on remaining {len(utterances)} utterances")
+
+        # Restore config
+        pipeline.config = config
 
     if input_args.ablation:
         # Run full ablation ladder

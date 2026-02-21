@@ -250,6 +250,7 @@ class ConformerBlock(nn.Module):
         dropout: float = 0.1,
         conv_kernel_size: int = 31,
         drop_path_prob: float = 0.1,
+        use_rope: bool = False,
     ):
         super().__init__()
         # First feed-forward module (half-step residual)
@@ -262,11 +263,14 @@ class ConformerBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # Multi-head self-attention
+        # Multi-head self-attention (optionally with RoPE)
         self.ln_attn = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout, batch_first=True
-        )
+        if use_rope:
+            self.attn = RoPEMultiheadAttention(d_model, nhead, dropout=dropout)
+        else:
+            self.attn = nn.MultiheadAttention(
+                d_model, nhead, dropout=dropout, batch_first=True
+            )
         self.dropout_attn = nn.Dropout(dropout)
 
         # Convolution module
@@ -390,6 +394,88 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, : x.size(1)]
 
 
+class RotaryPositionalEncoding(nn.Module):
+    """
+    Rotary Positional Embedding (RoPE) for self-attention.
+
+    Instead of adding positional info to the input, RoPE rotates the
+    query and key vectors in attention. This gives better length
+    generalization and is used in LLaMA, PaLM, etc.
+    """
+
+    def __init__(self, head_dim: int, max_len: int = 5000):
+        super().__init__()
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer("inv_freq", inv_freq)
+        t = torch.arange(max_len, dtype=torch.float)
+        freqs = torch.outer(t, inv_freq)
+        self.register_buffer("cos_cache", freqs.cos())
+        self.register_buffer("sin_cache", freqs.sin())
+
+    def rotate(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        q, k: [B, n_heads, T, head_dim]
+        """
+        T = q.shape[2]
+        cos = self.cos_cache[:T].unsqueeze(0).unsqueeze(0)
+        sin = self.sin_cache[:T].unsqueeze(0).unsqueeze(0)
+
+        def _rot(x):
+            d = x.shape[-1]
+            x1, x2 = x[..., : d // 2], x[..., d // 2 :]
+            return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
+        return _rot(q), _rot(k)
+
+
+class RoPEMultiheadAttention(nn.Module):
+    """Multi-head attention with Rotary Position Embeddings."""
+
+    def __init__(
+        self, d_model: int, nhead: int, dropout: float = 0.1, max_len: int = 5000
+    ):
+        super().__init__()
+        assert d_model % nhead == 0
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.rope = RotaryPositionalEncoding(self.head_dim, max_len)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, None]:
+        B, T, _ = query.shape
+        q = self.q_proj(query).view(B, T, self.nhead, self.head_dim).transpose(1, 2)
+        k = self.k_proj(key).view(B, T, self.nhead, self.head_dim).transpose(1, 2)
+        v = self.v_proj(value).view(B, T, self.nhead, self.head_dim).transpose(1, 2)
+        q, k = self.rope.rotate(q, k)
+
+        scale = self.head_dim**-0.5
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        if key_padding_mask is not None:
+            attn = attn.masked_fill(
+                key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf")
+            )
+        attn = torch.softmax(attn, dim=-1)
+        attn = self.attn_dropout(attn)
+
+        out = (
+            torch.matmul(attn, v).transpose(1, 2).contiguous().view(B, T, self.d_model)
+        )
+        return self.out_proj(out), None
+
+
 class NeuralTransformerCTCModel(nn.Module):
     """
     Conformer-based neural decoder for speech BCI.
@@ -417,6 +503,7 @@ class NeuralTransformerCTCModel(nn.Module):
         spec_augment_time_mask: int = 40,
         drop_path_prob: float = 0.1,
         autoencoder_residual: bool = False,
+        use_rope: bool = False,
         device: str = "cuda",
     ):
         super().__init__()
@@ -458,8 +545,15 @@ class NeuralTransformerCTCModel(nn.Module):
                 num_time_masks=2,
             )
 
-        # Positional encoding
-        self.pos_enc = PositionalEncoding(d_model=latent_dim)
+        # Positional encoding (sinusoidal for standard, no-op for RoPE since
+        # RoPE applies rotation inside attention instead)
+        self.use_rope = use_rope
+        if use_rope:
+            # RoPE doesn't need additive PE, but we keep the module for
+            # compatibility — its forward() is identity
+            self.pos_enc = nn.Identity()
+        else:
+            self.pos_enc = PositionalEncoding(d_model=latent_dim)
 
         # Conformer blocks with linearly increasing DropPath schedule
         # (layer 0 gets 0 drop, final layer gets drop_path_prob)
@@ -476,6 +570,7 @@ class NeuralTransformerCTCModel(nn.Module):
                     dropout=transformer_dropout,
                     conv_kernel_size=conformer_conv_kernel,
                     drop_path_prob=dp_rates[i],
+                    use_rope=use_rope,
                 )
                 for i in range(transformer_layers)
             ]
