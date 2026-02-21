@@ -71,8 +71,8 @@ class PipelineConfig:
     llm_load_in_8bit: bool = False
     lambda_neural: float = 0.5
     lambda_lm: float = 1.0
-    gamma_constraint: float = 2.0
-    length_penalty_beta: float = 0.0
+    gamma_constraint: float = 1.0
+    length_penalty_beta: float = 0.1
     slot_filling_beam: int = 10
 
     # D – Student
@@ -319,6 +319,7 @@ class DecodePipeline:
 
             elif self.config.decode_mode == "constrained_rescore":
                 # C1 – Constrained N-best rescoring
+                # Pre-compute LLM scores in batch for GPU efficiency.
                 llm = self._get_llm()
                 slot_decoder = SlotFillingDecoder(
                     llm_score_fn=llm.score,
@@ -328,11 +329,14 @@ class DecodePipeline:
                 )
                 cand_lists = [wh[0] for wh in result.word_hypotheses[:50]]
                 neural_scores = [wh[1] for wh in result.word_hypotheses[:50]]
+                sentences = [" ".join(words) for words in cand_lists]
+                lm_scores = llm.score_batch(sentences)
                 rescored = slot_decoder.rescore_nbest(
                     template,
                     cand_lists,
                     neural_scores,
                     length_penalty_beta=self.config.length_penalty_beta,
+                    lm_scores=lm_scores,
                 )
                 if rescored:
                     result.final_words = rescored[0][0]
@@ -340,14 +344,16 @@ class DecodePipeline:
 
             elif self.config.decode_mode == "unconstrained_rescore":
                 # Plain LLM rescoring (no constraint penalties)
+                # Uses batch scoring for GPU efficiency.
                 llm = self._get_llm()
                 cand_lists = [wh[0] for wh in result.word_hypotheses[:50]]
                 neural_scores = [wh[1] for wh in result.word_hypotheses[:50]]
 
+                sentences = [" ".join(words) for words in cand_lists]
+                lm_scores = llm.score_batch(sentences)
+
                 rescored = []
-                for words, ns in zip(cand_lists, neural_scores):
-                    sentence = " ".join(words)
-                    lm_score = llm.score(sentence)
+                for words, ns, lm_score in zip(cand_lists, neural_scores, lm_scores):
                     combined = (
                         self.config.lambda_neural * ns
                         + self.config.lambda_lm * lm_score

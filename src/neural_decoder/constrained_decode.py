@@ -352,6 +352,7 @@ class SlotFillingDecoder:
         candidates: List[List[str]],
         neural_scores: List[float],
         length_penalty_beta: float = 0.0,
+        lm_scores: Optional[List[float]] = None,
     ) -> List[Tuple[List[str], float]]:
         """
         C1-style constrained N-best rescoring.
@@ -360,13 +361,12 @@ class SlotFillingDecoder:
         candidates verbatim, so transcript-level adherence is 100% by
         construction.
 
-        **Locked-slot penalty**: Although the output is always a
-        candidate, the ``gamma_constraint`` penalty still serves a
-        purpose: different candidates may violate locked spans at
-        different positions, and the penalty acts as a *soft preference*
-        for candidates that respect the high-confidence locked words.
-        This is not redundant — it biases the rescorer toward
-        candidates consistent with the posterior-constrained template.
+        **Locked-slot penalty**: Uses edit-distance alignment between
+        the template's reference word sequence and each candidate to
+        correctly identify which candidate words correspond to which
+        template slots, even when candidates have different lengths
+        (insertions/deletions).  Penalty is applied only when a locked
+        slot's aligned candidate word differs from the locked word.
 
         Parameters
         ----------
@@ -375,6 +375,9 @@ class SlotFillingDecoder:
         neural_scores : parallel list of neural scores
         length_penalty_beta : float
             Length normalisation term.
+        lm_scores : list of float or None
+            Pre-computed LLM scores for each candidate.  If None,
+            ``self.llm_score_fn`` is called per candidate (slow).
 
         Returns
         -------
@@ -382,15 +385,32 @@ class SlotFillingDecoder:
         """
         results: List[Tuple[List[str], float]] = []
 
-        for words, ns in zip(candidates, neural_scores):
-            sentence = " ".join(words)
-            lm_score = self.llm_score_fn(sentence)
+        # Extract the template's reference word sequence for alignment
+        template_words = []
+        for slot in template.slots:
+            if slot.is_locked:
+                template_words.append(slot.locked_word or "")
+            elif slot.candidates:
+                template_words.append(slot.candidates[0])
+            else:
+                template_words.append("<unk>")
 
-            # Constraint penalty
+        # Compute LLM scores if not pre-computed
+        if lm_scores is None:
+            lm_scores = [self.llm_score_fn(" ".join(words)) for words in candidates]
+
+        for words, ns, lm_score in zip(candidates, neural_scores, lm_scores):
+            # Constraint penalty via edit-distance alignment
             constraint_penalty = 0.0
-            for slot in template.slots:
-                if slot.is_locked and slot.position < len(words):
-                    if words[slot.position] != slot.locked_word:
+            if template_words and words:
+                alignment = ConstrainedHypothesisBuilder._align_word_sequences(
+                    template_words, words
+                )
+                for tmpl_idx, cand_idx in alignment:
+                    if tmpl_idx is None or cand_idx is None:
+                        continue
+                    slot = template.slots[tmpl_idx]
+                    if slot.is_locked and words[cand_idx] != slot.locked_word:
                         constraint_penalty += self.gamma_constraint
 
             length_bonus = length_penalty_beta * len(words)

@@ -150,17 +150,68 @@ class LLMScorer:
         return total_log_prob / max(n_tokens, 1)
 
     @torch.no_grad()
-    def score_batch(self, texts: List[str]) -> List[float]:
-        """Score a batch of texts. Returns list of normalised log-probs."""
+    def score_batch(self, texts: List[str], batch_size: int = 16) -> List[float]:
+        """
+        Score a batch of texts with true batched forward passes.
+
+        Pads sequences to equal length within each mini-batch and runs
+        a single forward pass per mini-batch, which is much faster than
+        scoring one at a time on GPU.
+
+        Returns list of normalised log-probs.
+        """
         self._ensure_loaded()
 
         if not texts:
             return []
 
-        scores = []
-        for text in texts:
-            scores.append(self.score(text))
-        return scores
+        device = self._get_device()
+        all_scores: List[float] = [0.0] * len(texts)
+
+        # Filter out empty texts
+        valid_indices = [i for i, t in enumerate(texts) if t.strip()]
+        if not valid_indices:
+            return all_scores
+
+        for start in range(0, len(valid_indices), batch_size):
+            batch_indices = valid_indices[start : start + batch_size]
+            batch_texts = [texts[i] for i in batch_indices]
+
+            inputs = self._tokenizer(
+                batch_texts,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_length,
+                padding=True,
+            )
+            input_ids = inputs["input_ids"].to(device)
+            attention_mask = inputs["attention_mask"].to(device)
+
+            if input_ids.shape[1] <= 1:
+                continue
+
+            outputs = self._model(input_ids, attention_mask=attention_mask)
+            logits = outputs.logits  # [B, seq_len, vocab_size]
+
+            # Shift: logits[t] predicts input_ids[t+1]
+            shift_logits = logits[:, :-1, :]
+            shift_labels = input_ids[:, 1:]
+            shift_mask = attention_mask[:, 1:]  # mask for target tokens
+
+            log_probs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
+            token_log_probs = log_probs.gather(2, shift_labels.unsqueeze(-1)).squeeze(
+                -1
+            )  # [B, seq_len-1]
+
+            # Mask out padding tokens
+            token_log_probs = token_log_probs * shift_mask
+
+            for j, idx in enumerate(batch_indices):
+                n_tokens = shift_mask[j].sum().item()
+                total_lp = token_log_probs[j].sum().item()
+                all_scores[idx] = total_lp / max(n_tokens, 1)
+
+        return all_scores
 
     @torch.no_grad()
     def score_incremental(self, prefix: str, continuations: List[str]) -> List[float]:
