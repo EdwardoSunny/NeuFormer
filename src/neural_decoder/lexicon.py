@@ -538,24 +538,22 @@ class PronunciationLexicon:
     ) -> List[Tuple[str, float]]:
         """
         Find lexicon words whose pronunciation best matches the given
-        phoneme chunk.  Returns (word, edit_distance) pairs.
+        phoneme chunk.  Returns (word, edit_distance) pairs sorted by
+        edit distance (exact matches first, then fuzzy).
         """
-        candidates: List[Tuple[str, float]] = []
+        best: List[Tuple[str, float]] = []
+        seen_words: set = set()
 
-        # Try exact match first (fast path)
+        # Exact matches (edit distance 0)
         chunk_key = tuple(chunk)
         if chunk_key in self._pron_to_words:
             for w in self._pron_to_words[chunk_key]:
-                candidates.append((w, 0.0))
+                best.append((w, 0.0))
+                seen_words.add(w)
 
-        if candidates:
-            return candidates[:max_candidates]
-
-        # Fuzzy match: use length-indexed lookup to avoid scanning
+        # Fuzzy matches: use length-indexed lookup to avoid scanning
         # all entries.  Only check pronunciations within ±max_edit_dist
         # of the chunk length, reducing O(V) to O(V_similar_length).
-        best: List[Tuple[str, float]] = []
-        seen_words: set = set()
         chunk_len = len(chunk)
         for pron_len in range(
             max(1, chunk_len - self.max_edit_dist),

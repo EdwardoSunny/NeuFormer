@@ -80,12 +80,12 @@ class PipelineConfig:
     decode_mode: str = "online"
 
     # ---- CTC beam search (phoneme-level, used by legacy modes) ----
-    beam_width: int = 18
+    beam_width: int = 25
     n_best: int = 100
     blank_penalty: float = 0.693  # log(2), online default
 
     # ---- Lexicon ----
-    max_edit_dist: int = 1
+    max_edit_dist: int = 2
     lexicon_beam_width: int = 5
 
     # ---- N-gram LM ----
@@ -100,7 +100,7 @@ class PipelineConfig:
     # ---- Word-level beam search ----
     use_word_beam: bool = True
     word_beam_width: int = 18  # paper: 18
-    word_max_candidates: int = 8
+    word_max_candidates: int = 20
 
     # ---- Offline-specific ----
     offline_ngram_order: int = 5  # 5-gram for offline first pass
@@ -134,7 +134,7 @@ class PipelineConfig:
 
     # ---- Legacy N-gram params ----
     ngram_weight: float = 0.5  # weight during lexicon beam search (legacy)
-    phoneme_beam_width: int = 8
+    phoneme_beam_width: int = 25
     word_ngram_alpha: float = 0.5
 
     # ---- Student (legacy) ----
@@ -240,42 +240,15 @@ class DecodePipeline:
             self._ngram_lm.train(training_sentences)
 
             # Build online word-level decoder
-            # Paper score: score(b) = alpha * log P_enc(b) + log P_ngram(b)
-            # We implement this as: combined = ctc_logp + (1/alpha) * ngram_logp_ln
-            # But it's cleaner to just set ngram_alpha = 1/alpha so that:
-            #   combined = ctc_logp + ngram_alpha * ngram_logp_in_ln
-            # Since N-gram returns log10, and CTC is in ln:
-            #   ngram_alpha converts: ngram_alpha * log10(P) * ln(10) = log(P)/alpha
-            # Actually, the paper formula is:
-            #   score = alpha * log_enc + log_ngram
-            # Both in the same log base. Let's use natural log throughout.
-            # ngram_alpha = 1.0 / alpha means:
-            #   alpha * ctc + ngram = alpha * (ctc + (1/alpha) * ngram)
-            # We can just store the raw score as alpha*ctc + ngram.
-            # In WordLevelCTCDecoder, combined = ctc + ngram_alpha * ng * LOG10
-            # So we want: alpha * ctc + ngram_ln
-            # = alpha * (ctc + (1/alpha) * ngram_ln)
-            # Since the decoder already multiplies ctc by 1 (not alpha), we need
-            # to weight ngram relative to ctc. If we set ngram_alpha = 1/alpha:
-            #   combined = ctc + (1/alpha) * ngram_ln
-            # Then multiply final score by alpha to get: alpha*ctc + ngram_ln ✓
-            #
-            # Simpler: just set ngram_alpha = 1.0/alpha. The relative ranking
-            # is what matters for beam pruning, and the final score from the
-            # decoder's combined_score already has the right ordering.
-
-            ngram_alpha_online = (
-                1.0 / self.config.alpha if self.config.alpha > 0 else 1.0
-            )
-
+            # Paper formula: score(b) = alpha * log P_enc(b) + log P_ngram(b)
+            # alpha < 1 down-weights CTC so N-gram has more influence.
             self._word_decoder = WordLevelCTCDecoder(
                 beam_width=self.config.word_beam_width,
-                phoneme_beam_width=self.config.phoneme_beam_width,
                 blank=BLANK_IDX,
                 sil=SIL_IDX,
                 n_best=self.config.n_best,
                 blank_penalty=self.config.blank_penalty,
-                ngram_alpha=ngram_alpha_online,
+                alpha=self.config.alpha,
                 lexicon=self.lexicon,
                 ngram_lm=self._ngram_lm,
                 max_word_candidates=self.config.word_max_candidates,
@@ -286,18 +259,13 @@ class DecodePipeline:
             self._ngram_lm_offline = NgramLM(order=self.config.offline_ngram_order)
             self._ngram_lm_offline.train(training_sentences)
 
-            ngram_alpha_offline = (
-                1.0 / self.config.alpha if self.config.alpha > 0 else 1.0
-            )
-
             self._word_decoder_offline = WordLevelCTCDecoder(
                 beam_width=self.config.word_beam_width,
-                phoneme_beam_width=self.config.phoneme_beam_width,
                 blank=BLANK_IDX,
                 sil=SIL_IDX,
                 n_best=self.config.n_best,
                 blank_penalty=self.config.offline_blank_penalty,
-                ngram_alpha=ngram_alpha_offline,
+                alpha=self.config.alpha,
                 lexicon=self.lexicon,
                 ngram_lm=self._ngram_lm_offline,
                 max_word_candidates=self.config.word_max_candidates,

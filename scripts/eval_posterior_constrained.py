@@ -330,7 +330,10 @@ def main():
         "--device", type=str, default="cuda", help="Device for neural model"
     )
     parser.add_argument(
-        "--beam_width", type=int, default=18, help="Beam width (paper: 18)"
+        "--beam_width",
+        type=int,
+        default=25,
+        help="Beam width (paper: 18, default: 25 for more diversity)",
     )
     parser.add_argument(
         "--n_best",

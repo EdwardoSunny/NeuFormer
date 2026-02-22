@@ -453,30 +453,34 @@ class WordCTCHypothesis:
 
 class WordLevelCTCDecoder:
     """
-    Two-phase CTC decoder with N-gram shallow fusion.
+    CTC prefix beam search with N-gram shallow fusion at word boundaries.
 
-    **Phase 1**: Run a fast phoneme-level CTC prefix beam search
-    (the existing CTCBeamDecoder) to get a diverse set of phoneme
-    hypotheses.  This is O(T × beam × C) and takes seconds.
+    Implements the paper's approach (Willett et al. 2023, Section F):
+    the N-gram LM is integrated **during** CTC beam search, not after.
 
-    **Phase 2**: For each phoneme hypothesis, split on SIL tokens
-    to get word-level phoneme chunks.  For each chunk, look up
-    multiple word candidates in the lexicon.  Then run an N-gram
-    beam search over the word combinations to produce word-level
-    hypotheses scored by:
+    Each beam state tracks:
+      - phoneme prefix (for CTC collapsing rules)
+      - current word's phoneme buffer (phones since last SIL)
+      - completed word history
+      - accumulated N-gram log-probability
 
+    At each frame:
+      - Blank/repeat: standard CTC rules
+      - SIL emission: complete current word via lexicon lookup,
+        add N-gram score, reset phoneme buffer
+      - Other phoneme: extend phoneme buffer
+
+    Beam pruning uses the **combined score**:
         score(b) = alpha * log P_enc(b) + log P_ngram(b)
 
-    This avoids the combinatorial explosion of the naive approach
-    (compound word×phoneme keys at every frame) while still producing
-    word-level diverse N-best lists.
+    This means the N-gram influences which beams survive, allowing
+    linguistically plausible paths to be kept even if their CTC
+    score is slightly lower.
 
     Parameters
     ----------
     beam_width : int
-        Phoneme-level CTC beam width (Phase 1).
-    phoneme_beam_width : int
-        Number of phoneme hypotheses to keep from Phase 1.
+        Number of active beams during CTC search.
     blank : int
         CTC blank index.
     sil : int
@@ -485,15 +489,15 @@ class WordLevelCTCDecoder:
         Number of word-level hypotheses to return.
     blank_penalty : float
         Additive log-penalty for blank emissions.
-    ngram_alpha : float
-        Weight for N-gram score relative to CTC score.
-        Combined: ctc_logp + ngram_alpha * ngram_log10 * log(10)
+    alpha : float
+        CTC score weight (paper's alpha, typically 0.8).
+        score = alpha * ctc + ngram
     lexicon : object or None
         PronunciationLexicon instance.
     ngram_lm : object or None
         NgramLM instance.
     max_word_candidates : int
-        Maximum lexicon matches per phoneme chunk.
+        Maximum lexicon matches when completing a word at SIL.
     """
 
     LOG10 = math.log(10.0)  # ≈ 2.3026
@@ -501,34 +505,27 @@ class WordLevelCTCDecoder:
     def __init__(
         self,
         beam_width: int = 25,
-        phoneme_beam_width: int = 8,
         blank: int = 0,
         sil: int = 40,
         n_best: int = 50,
         blank_penalty: float = 0.693,
-        ngram_alpha: float = 0.5,
+        alpha: float = 0.8,
         lexicon=None,
         ngram_lm=None,
-        max_word_candidates: int = 8,
+        max_word_candidates: int = 20,
+        # Legacy params (ignored, kept for backward compat)
+        phoneme_beam_width: int = 25,
+        ngram_alpha: float = 1.25,
     ):
         self.beam_width = beam_width
-        self.phoneme_beam_width = phoneme_beam_width
         self.blank = blank
         self.sil = sil
         self.n_best = n_best
         self.blank_penalty = blank_penalty
-        self.ngram_alpha = ngram_alpha
+        self.alpha = alpha
         self.lexicon = lexicon
         self.ngram_lm = ngram_lm
         self.max_word_candidates = max_word_candidates
-
-        # Internal phoneme-level decoder (fast)
-        self._phoneme_decoder = CTCBeamDecoder(
-            beam_width=beam_width,
-            blank=blank,
-            n_best=phoneme_beam_width,
-            blank_penalty=blank_penalty,
-        )
 
     def decode(
         self,
@@ -536,7 +533,7 @@ class WordLevelCTCDecoder:
         length: Optional[int] = None,
     ) -> List[WordCTCHypothesis]:
         """
-        Two-phase decode: phoneme beam search → word-level N-gram beam.
+        CTC prefix beam search with N-gram scoring at word boundaries.
 
         Parameters
         ----------
@@ -556,146 +553,256 @@ class WordLevelCTCDecoder:
                 "Set lexicon= in the constructor."
             )
 
-        T_orig = log_probs.shape[0]
-        T = min(T_orig, int(length)) if length is not None else T_orig
+        T, C = log_probs.shape
+        if length is not None:
+            T = min(T, int(length))
+        log_probs = log_probs[:T]
 
-        use_ngram = (
-            self.ngram_lm is not None
-            and self.ngram_alpha > 0
-            and self.ngram_lm.is_ready
-        )
+        use_ngram = self.ngram_lm is not None and self.ngram_lm.is_ready
 
-        # ---- Phase 1: Fast phoneme-level CTC beam search ----
-        phone_hyps = self._phoneme_decoder.decode(log_probs, length)
+        alpha = self.alpha
 
-        if not phone_hyps:
-            return []
+        # Apply blank penalty
+        penalised = log_probs.copy()
+        if self.blank_penalty != 0.0:
+            penalised[:, self.blank] -= self.blank_penalty
 
-        # ---- Phase 2: Word-level N-gram beam search ----
-        # For each phoneme hypothesis, split on SIL, look up word
-        # candidates, and score with N-gram.
-        all_word_hyps: List[WordCTCHypothesis] = []
+        NEG_INF = -math.inf
 
-        for phone_hyp in phone_hyps:
-            pids = phone_hyp.phoneme_ids
-            ctc_lp = phone_hyp.log_prob
+        # ---- Beam state ----
+        # Key: (phoneme_prefix, word_history_tuple)
+        #   phoneme_prefix: tuple of phoneme IDs (CTC collapsed)
+        #   word_history_tuple: tuple of completed words
+        #
+        # Value: [p_blank, p_non_blank, word_phones, ngram_log10]
+        #   p_blank: log P(prefix, blank at t)
+        #   p_non_blank: log P(prefix, non-blank at t)
+        #   word_phones: list of phoneme IDs for current (incomplete) word
+        #   ngram_log10: accumulated N-gram score (log10)
 
-            # Split phoneme sequence on SIL to get word chunks
-            chunks = self._split_on_sil(pids)
+        # Type alias for clarity
+        # state_key = (phone_prefix_tuple, word_history_tuple)
+        # state_val = [p_blank, p_non_blank, word_phones_list, ngram_log10]
 
-            if not chunks:
-                # No phonemes (all blank/SIL) — empty hypothesis
-                all_word_hyps.append(
-                    WordCTCHypothesis(
-                        words=[],
-                        phoneme_ids=pids,
-                        ctc_log_prob=ctc_lp,
-                        ngram_log_prob=0.0,
-                        combined_score=ctc_lp,
-                        frame_alignment=phone_hyp.frame_alignment,
-                        frame_log_probs=phone_hyp.frame_log_probs,
-                        label_posteriors=phone_hyp.label_posteriors,
-                    )
-                )
+        beams: Dict[Tuple[Tuple[int, ...], Tuple[str, ...]], List] = {}
+
+        # Initialize: empty prefix, no words
+        empty_key = ((), ())
+        beams[empty_key] = [penalised[0, self.blank], NEG_INF, [], 0.0]
+
+        # Initialize with first-frame non-blank emissions
+        for c in range(C):
+            if c == self.blank:
                 continue
+            if c == self.sil:
+                # SIL at start = still empty word buffer
+                key = ((c,), ())
+                beams[key] = [NEG_INF, penalised[0, c], [], 0.0]
+            else:
+                key = ((c,), ())
+                beams[key] = [NEG_INF, penalised[0, c], [c], 0.0]
 
-            # Get word candidates for each chunk
-            chunk_candidates: List[List[Tuple[str, float]]] = []
-            for chunk in chunks:
-                candidates = self.lexicon._find_word_candidates(
-                    chunk, max_candidates=self.max_word_candidates
-                )
-                if not candidates:
-                    candidates = [("<unk>", float(len(chunk)))]
-                chunk_candidates.append(candidates)
+        for t in range(1, T):
+            new_beams: Dict[Tuple[Tuple[int, ...], Tuple[str, ...]], List] = {}
 
-            # N-gram beam search over word combinations
-            # Beam: (word_list, edit_cost, ngram_log10)
-            word_beam: List[Tuple[List[str], float, float]] = [([], 0.0, 0.0)]
-            word_beam_width = max(self.n_best, 20)
+            # Score each beam for pruning:
+            # combined = alpha * ctc + ngram_ln
+            def _beam_score(key):
+                val = beams[key]
+                ctc = _log_add(val[0], val[1])
+                ng_ln = val[3] * self.LOG10  # convert log10 to ln
+                return alpha * ctc + ng_ln
 
-            for candidates in chunk_candidates:
-                new_beam: List[Tuple[List[str], float, float]] = []
-                for words, edit_cost, ng_acc in word_beam:
-                    for cand_word, cand_edit in candidates:
-                        new_edit = edit_cost + cand_edit
+            scored_keys = sorted(beams.keys(), key=_beam_score, reverse=True)
+            top_keys = scored_keys[: self.beam_width]
 
-                        if use_ngram:
-                            context = ["<s>"] + words
-                            ng_score = self.ngram_lm.score_word(cand_word, context)
-                            new_ng = ng_acc + ng_score
+            for key in top_keys:
+                phone_prefix, word_hist = key
+                pb, pnb, word_phones, ng_acc = beams[key]
+                p_total = _log_add(pb, pnb)
+
+                # --- extend with blank ---
+                new_pb = p_total + penalised[t, self.blank]
+                if key not in new_beams:
+                    new_beams[key] = [NEG_INF, NEG_INF, list(word_phones), ng_acc]
+                new_beams[key][0] = _log_add(new_beams[key][0], new_pb)
+
+                # --- extend with non-blank ---
+                for c in range(C):
+                    if c == self.blank:
+                        continue
+
+                    if c == self.sil:
+                        # ---- SIL: word boundary ----
+                        # Complete current word and start new one
+                        ext_prefix = phone_prefix + (c,)
+
+                        if word_phones:
+                            # Look up word in lexicon
+                            new_word, edit_dist = self._lookup_word(word_phones)
+                            new_word_hist = word_hist + (new_word,)
+
+                            # N-gram score for completed word
+                            if use_ngram:
+                                context = ["<s>"] + list(word_hist)
+                                ng_score = self.ngram_lm.score_word(new_word, context)
+                                new_ng = ng_acc + ng_score
+                            else:
+                                new_ng = ng_acc
+
+                            # Penalize edit distance
+                            edit_penalty = edit_dist * 0.5  # in log10 scale
+                            new_ng -= edit_penalty
                         else:
+                            # Empty word buffer (consecutive SILs)
+                            new_word_hist = word_hist
                             new_ng = ng_acc
 
-                        new_beam.append((words + [cand_word], new_edit, new_ng))
+                        new_key = (ext_prefix, new_word_hist)
 
-                # Prune: sort by combined score (lower edit + higher ngram = better)
-                # We want: minimize edit_cost, maximize ngram
-                # Score: -edit_cost + ngram_alpha * ngram * log(10)
-                new_beam.sort(
-                    key=lambda x: -x[1] + self.ngram_alpha * x[2] * self.LOG10,
-                    reverse=True,
-                )
-                word_beam = new_beam[:word_beam_width]
+                        if phone_prefix and c == phone_prefix[-1]:
+                            # SIL repeat: only blank-path can emit
+                            new_pnb = pb + penalised[t, c]
+                            if new_key not in new_beams:
+                                new_beams[new_key] = [NEG_INF, NEG_INF, [], new_ng]
+                            new_beams[new_key][1] = _log_add(
+                                new_beams[new_key][1], new_pnb
+                            )
+                            # Also collapse repeat into current prefix
+                            if key not in new_beams:
+                                new_beams[key] = [
+                                    NEG_INF,
+                                    NEG_INF,
+                                    list(word_phones),
+                                    ng_acc,
+                                ]
+                            new_beams[key][1] = _log_add(
+                                new_beams[key][1], pnb + penalised[t, c]
+                            )
+                        else:
+                            new_pnb = p_total + penalised[t, c]
+                            if new_key not in new_beams:
+                                new_beams[new_key] = [NEG_INF, NEG_INF, [], new_ng]
+                            new_beams[new_key][1] = _log_add(
+                                new_beams[new_key][1], new_pnb
+                            )
 
-            # Normalise CTC score per frame
-            ctc_per_frame = ctc_lp / max(T, 1)
+                    else:
+                        # ---- Regular phoneme ----
+                        ext_prefix = phone_prefix + (c,)
+                        new_word_phones = list(word_phones) + [c]
 
-            # Create word-level hypotheses from the beam
-            for words, edit_cost, ng_log10 in word_beam:
-                # Combined score following the paper:
-                # score = alpha * log P_enc + log P_ngram
-                # We use ctc_lp (not per-frame) and convert ngram to ln
-                combined = (
-                    ctc_lp
-                    - edit_cost  # penalty for fuzzy matches
-                    + self.ngram_alpha * ng_log10 * self.LOG10
-                )
+                        new_key = (ext_prefix, word_hist)
 
-                all_word_hyps.append(
-                    WordCTCHypothesis(
-                        words=words,
-                        phoneme_ids=pids,
-                        ctc_log_prob=ctc_lp,
-                        ngram_log_prob=ng_log10,
-                        combined_score=combined,
-                        frame_alignment=phone_hyp.frame_alignment,
-                        frame_log_probs=phone_hyp.frame_log_probs,
-                        # Only keep label_posteriors for the best phoneme hyp
-                        label_posteriors=phone_hyp.label_posteriors,
-                    )
-                )
+                        if phone_prefix and c == phone_prefix[-1]:
+                            # Same label as last: only blank-path extends
+                            new_pnb = pb + penalised[t, c]
+                            if new_key not in new_beams:
+                                new_beams[new_key] = [
+                                    NEG_INF,
+                                    NEG_INF,
+                                    new_word_phones,
+                                    ng_acc,
+                                ]
+                            new_beams[new_key][1] = _log_add(
+                                new_beams[new_key][1], new_pnb
+                            )
+                            # Collapse repeat into current prefix
+                            if key not in new_beams:
+                                new_beams[key] = [
+                                    NEG_INF,
+                                    NEG_INF,
+                                    list(word_phones),
+                                    ng_acc,
+                                ]
+                            new_beams[key][1] = _log_add(
+                                new_beams[key][1], pnb + penalised[t, c]
+                            )
+                        else:
+                            new_pnb = p_total + penalised[t, c]
+                            if new_key not in new_beams:
+                                new_beams[new_key] = [
+                                    NEG_INF,
+                                    NEG_INF,
+                                    new_word_phones,
+                                    ng_acc,
+                                ]
+                            new_beams[new_key][1] = _log_add(
+                                new_beams[new_key][1], new_pnb
+                            )
 
-        # Sort all hypotheses by combined score
-        all_word_hyps.sort(key=lambda h: h.combined_score, reverse=True)
+            beams = new_beams
 
-        # De-duplicate by word sequence
-        seen: set = set()
-        deduped: List[WordCTCHypothesis] = []
-        for hyp in all_word_hyps:
-            key = tuple(hyp.words)
-            if key not in seen:
-                seen.add(key)
-                deduped.append(hyp)
+        # ---- Collect N-best ----
+        # Final word completion: any remaining word_phones become the last word
+        results: List[WordCTCHypothesis] = []
+        seen_words: set = set()
 
-        return deduped[: self.n_best]
+        for key in beams:
+            phone_prefix, word_hist = key
+            pb, pnb, word_phones, ng_acc = beams[key]
+            ctc_score = _log_add(pb, pnb)
 
-    def _split_on_sil(self, phoneme_ids: List[int]) -> List[List[int]]:
-        """Split phoneme IDs on SIL tokens, filtering blanks."""
-        chunks: List[List[int]] = []
-        current: List[int] = []
-        for pid in phoneme_ids:
-            if pid == self.blank:
+            if ctc_score == NEG_INF:
                 continue
-            if pid == self.sil:
-                if current:
-                    chunks.append(current)
-                    current = []
-            else:
-                current.append(pid)
-        if current:
-            chunks.append(current)
-        return chunks
+
+            # Complete final word if there are remaining phonemes
+            final_words = list(word_hist)
+            final_ng = ng_acc
+
+            if word_phones:
+                final_word, edit_dist = self._lookup_word(word_phones)
+                final_words.append(final_word)
+                if use_ngram:
+                    context = ["<s>"] + list(word_hist)
+                    ng_score = self.ngram_lm.score_word(final_word, context)
+                    final_ng += ng_score
+                final_ng -= edit_dist * 0.5
+
+            combined = alpha * ctc_score + final_ng * self.LOG10
+
+            word_key = tuple(final_words)
+            if word_key in seen_words:
+                continue
+            seen_words.add(word_key)
+
+            results.append(
+                WordCTCHypothesis(
+                    words=final_words,
+                    phoneme_ids=list(phone_prefix),
+                    ctc_log_prob=ctc_score,
+                    ngram_log_prob=final_ng,
+                    combined_score=combined,
+                    frame_alignment=[],  # populated for 1-best below
+                    frame_log_probs=log_probs,
+                    label_posteriors=None,
+                )
+            )
+
+        results.sort(key=lambda h: h.combined_score, reverse=True)
+        results = results[: self.n_best]
+
+        # Compute forced alignment for 1-best
+        if results and results[0].phoneme_ids:
+            alignment, _ = ctc_forced_align(
+                log_probs, results[0].phoneme_ids, blank=self.blank
+            )
+            gamma = ctc_forward_backward(
+                log_probs, results[0].phoneme_ids, blank=self.blank
+            )
+            results[0].frame_alignment = alignment
+            results[0].label_posteriors = gamma
+
+        return results
+
+    def _lookup_word(self, phones: List[int]) -> Tuple[str, float]:
+        """Look up best word for a phoneme chunk. Returns (word, edit_dist)."""
+        candidates = self.lexicon._find_word_candidates(
+            phones, max_candidates=self.max_word_candidates
+        )
+        if candidates:
+            return candidates[0]  # best match (lowest edit distance)
+        return ("<unk>", float(len(phones)))
 
     def decode_batch(
         self,
