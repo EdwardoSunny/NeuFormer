@@ -21,6 +21,8 @@ import re
 import sys
 import time
 
+from tqdm import tqdm
+
 import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -119,7 +121,8 @@ def extract_logits(model, args, data_partition, loaded_data, device="cuda"):
     results = []
     is_conformer = args.get("model_type", "gru_baseline") == "transformer_ctc"
 
-    for day_idx in range(len(loaded_data[data_partition])):
+    n_days = len(loaded_data[data_partition])
+    for day_idx in tqdm(range(n_days), desc="Extracting logits", unit="day"):
         day_data = loaded_data[data_partition][day_idx]
         ds = SpeechDataset([day_data])
         loader = DataLoader(
@@ -214,7 +217,7 @@ def run_decode_mode(
 
     start_time = time.time()
 
-    for utt in utterances:
+    for utt in tqdm(utterances, desc=mode_name, unit="utt"):
         result = pipeline.decode_utterance(utt["log_probs"], utt["length"])
 
         # Predicted words
