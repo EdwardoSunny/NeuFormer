@@ -101,11 +101,16 @@ class NgramLM:
         # Try KenLM first
         if self._try_train_kenlm(sentences):
             self._trained = True
+            print(f"  N-gram LM ({self.order}-gram): trained with KenLM backend")
             return
 
         # Pure-Python fallback
         self._train_python(sentences)
         self._trained = True
+        print(
+            f"  N-gram LM ({self.order}-gram): trained with pure-Python backend "
+            f"({len(self._vocab)} vocab, {sum(len(v) for v in self._ngram_counts.values())} total n-grams)"
+        )
 
     def _try_train_kenlm(self, sentences: List[str]) -> bool:
         """Try to train via KenLM's lmplz (much faster, better smoothing)."""
@@ -198,6 +203,18 @@ class NgramLM:
 
         self._total_unigrams = sum(self._ngram_counts[1].values())
         self._vocab.add("<unk>")
+
+        # Precompute number of unique continuations per context for
+        # backoff weight calculation.  Without this, _score_word_python
+        # has to scan all N-grams per query — O(V) per word.
+        self._n_unique_continuations: Dict[int, Dict[Tuple[str, ...], int]] = {}
+        for n in range(2, self.order + 1):
+            unique_map: Dict[Tuple[str, ...], int] = defaultdict(int)
+            for ngram, count in self._ngram_counts[n].items():
+                if count > 0:
+                    ctx = ngram[:-1]
+                    unique_map[ctx] += 1
+            self._n_unique_continuations[n] = dict(unique_map)
 
     @property
     def is_ready(self) -> bool:
@@ -328,14 +345,8 @@ class NgramLM:
                 if ctx_count > 0 and ngram_count > 0:
                     # Absolute discount
                     prob = max(ngram_count - self.discount, 0) / ctx_count
-                    # Backoff weight
-                    n_unique = len(
-                        [
-                            ng
-                            for ng in self._ngram_counts[n]
-                            if ng[:-1] == ctx and self._ngram_counts[n][ng] > 0
-                        ]
-                    )
+                    # Backoff weight (precomputed unique continuations)
+                    n_unique = self._n_unique_continuations.get(n, {}).get(ctx, 0)
                     backoff_weight = (self.discount * n_unique) / ctx_count
                     # Recursively get lower-order prob
                     lower_logp = self._score_word_python(word, list(ctx[1:]))

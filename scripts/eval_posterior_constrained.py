@@ -216,9 +216,22 @@ def run_decode_mode(
     all_candidate_sets = []
 
     start_time = time.time()
+    n_diag = 5  # Print diagnostics for first N utterances
 
-    for utt in tqdm(utterances, desc=mode_name, unit="utt"):
+    for utt_idx, utt in enumerate(tqdm(utterances, desc=mode_name, unit="utt")):
         result = pipeline.decode_utterance(utt["log_probs"], utt["length"])
+
+        # Diagnostics: print score breakdown for first few utterances
+        if utt_idx < n_diag and result.word_beam_hypotheses:
+            ref_sentence = utt["transcription"]
+            tqdm.write(f"\n  [diag {utt_idx}] ref: {ref_sentence}")
+            for rank, wh in enumerate(result.word_beam_hypotheses[:3]):
+                tqdm.write(
+                    f'    #{rank}: "{" ".join(wh.words)}" '
+                    f"ctc={wh.ctc_log_prob:.1f} "
+                    f"ng={wh.ngram_log_prob:.2f} "
+                    f"combined={wh.combined_score:.1f}"
+                )
 
         # Predicted words
         pred_words = result.final_words
