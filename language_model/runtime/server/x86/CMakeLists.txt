@@ -115,6 +115,8 @@ if(NOT MSVC)
     BINARY_DIR        ${openfst_BINARY_DIR}
     CONFIGURE_COMMAND ${openfst_SOURCE_DIR}/configure --prefix=${openfst_PREFIX_DIR}
                         "CPPFLAGS=-I${gflags_BINARY_DIR}/include -I${glog_SOURCE_DIR}/src -I${glog_BINARY_DIR} -D_GLIBCXX_USE_CXX11_ABI=0"
+                        "CXXFLAGS=-fPIC -fcommon -D_GLIBCXX_USE_CXX11_ABI=0"
+                        "CFLAGS=-fPIC -fcommon"
                         "LDFLAGS=-L${gflags_BINARY_DIR} -L${glog_BINARY_DIR}"
                         "LIBS=-lgflags_nothreads -lglog -lpthread"
     COMMAND           ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/patch/openfst ${openfst_SOURCE_DIR}
