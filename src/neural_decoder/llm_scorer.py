@@ -76,8 +76,17 @@ class LLMScorer:
 
         load_kwargs = {}
         if self.load_in_8bit:
-            load_kwargs["load_in_8bit"] = True
-            load_kwargs["device_map"] = "auto"
+            try:
+                from transformers import BitsAndBytesConfig
+
+                load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_8bit=True,
+                )
+                load_kwargs["device_map"] = "auto"
+            except ImportError:
+                # Older transformers or no bitsandbytes — try legacy kwarg
+                load_kwargs["load_in_8bit"] = True
+                load_kwargs["device_map"] = "auto"
         elif self.device == "auto":
             load_kwargs["device_map"] = "auto"
 
