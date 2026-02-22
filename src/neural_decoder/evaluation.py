@@ -1,333 +1,152 @@
 """
-E – Evaluation Pipeline
-========================
-Computes WER, CER, PER, constraint adherence, runtime, and
-confidence-bucket breakdowns for the full ablation ladder:
-
-1. Neural-only (greedy CTC)
-2. + CTC beam search
-3. + Lexicon phoneme→word
-4. + LLM rescoring (unconstrained)
-5. + Posterior-constrained LLM (novelty)
-6. + Distilled student
+Evaluation Utilities
+=====================
+WER computation and result reporting for the decoding pipeline.
 
 Usage
 -----
-    from neural_decoder.evaluation import evaluate_wer, evaluate_cer, EvalReport
-    wer = evaluate_wer(predicted_words, reference_words)
+    from neural_decoder.evaluation import compute_wer, remove_punctuation
+    wer = compute_wer(predicted_sentences, reference_sentences)
 """
 
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+import re
+from typing import List, Optional, Tuple
 
-import numpy as np
-from edit_distance import SequenceMatcher
+import editdistance
 
 
-# ======================================================================
-# Core metrics
-# ======================================================================
-
-
-def edit_distance(a: List, b: List) -> int:
-    """Levenshtein edit distance between two sequences."""
-    matcher = SequenceMatcher(a=a, b=b)
-    return matcher.distance()
-
-
-def evaluate_wer(
-    predictions: List[List[str]],
-    references: List[List[str]],
-) -> float:
+def remove_punctuation(sentence: str) -> str:
     """
-    Word Error Rate (WER) = total_edits / total_ref_words.
+    Remove punctuation from a sentence, keeping only letters, hyphens,
+    apostrophes, and spaces.  Lowercases the result.
 
-    Parameters
-    ----------
-    predictions : list of word lists
-    references : list of word lists
-
-    Returns
-    -------
-    float  WER in [0, ∞)
+    Ported from the NEJM brain-to-text repo.
     """
-    total_edits = 0
-    total_ref = 0
-    for pred, ref in zip(predictions, references):
-        total_edits += edit_distance(ref, pred)
-        total_ref += len(ref)
-    return total_edits / max(total_ref, 1)
+    sentence = re.sub(r"[^a-zA-Z\- ']", "", sentence)
+    sentence = sentence.replace("- ", " ").lower()
+    sentence = sentence.replace("--", "").lower()
+    sentence = sentence.replace(" '", "'").lower()
+    sentence = sentence.strip()
+    sentence = " ".join([word for word in sentence.split() if word != ""])
+    return sentence
 
 
-def evaluate_cer(
+def compute_wer(
     predictions: List[str],
     references: List[str],
-) -> float:
+    clean: bool = True,
+) -> Tuple[float, int, int]:
     """
-    Character Error Rate (CER) = total_char_edits / total_ref_chars.
+    Compute aggregate Word Error Rate over a list of sentence pairs.
 
     Parameters
     ----------
-    predictions : list of strings
-    references : list of strings
+    predictions : list of str
+        Predicted sentences.
+    references : list of str
+        Reference (ground truth) sentences.
+    clean : bool
+        If True, apply remove_punctuation() to both predictions and references.
+
+    Returns
+    -------
+    wer : float
+        Aggregate WER (total_edit_distance / total_ref_words).
+    total_edit_distance : int
+        Total word-level edit distance.
+    total_ref_words : int
+        Total number of reference words.
     """
-    total_edits = 0
-    total_ref = 0
+    total_edit_distance = 0
+    total_ref_words = 0
+
     for pred, ref in zip(predictions, references):
-        total_edits += edit_distance(list(ref), list(pred))
-        total_ref += len(ref)
-    return total_edits / max(total_ref, 1)
+        if clean:
+            pred = remove_punctuation(pred)
+            ref = remove_punctuation(ref)
+
+        pred_words = pred.strip().split()
+        ref_words = ref.strip().split()
+
+        ed = editdistance.eval(ref_words, pred_words)
+        total_edit_distance += ed
+        total_ref_words += len(ref_words)
+
+    wer = total_edit_distance / max(total_ref_words, 1)
+    return wer, total_edit_distance, total_ref_words
 
 
-def evaluate_per(
-    predictions: List[List[int]],
-    references: List[List[int]],
-) -> float:
+def compute_wer_per_sentence(
+    predictions: List[str],
+    references: List[str],
+    clean: bool = True,
+) -> List[Tuple[float, int, int]]:
     """
-    Phoneme Error Rate (PER) = total_phone_edits / total_ref_phones.
+    Compute per-sentence WER.
+
+    Returns
+    -------
+    list of (wer, edit_distance, n_ref_words)
     """
-    total_edits = 0
-    total_ref = 0
+    results = []
     for pred, ref in zip(predictions, references):
-        total_edits += edit_distance(ref, pred)
-        total_ref += len(ref)
-    return total_edits / max(total_ref, 1)
+        if clean:
+            pred = remove_punctuation(pred)
+            ref = remove_punctuation(ref)
 
+        pred_words = pred.strip().split()
+        ref_words = ref.strip().split()
 
-def oracle_wer(
-    candidate_sets: List[List[List[str]]],
-    references: List[List[str]],
-) -> float:
-    """
-    Oracle N-best WER: for each utterance, pick the candidate from the
-    N-best list that minimizes WER against the reference.
-
-    This measures the *ceiling* of any rescoring approach — if the
-    correct words aren't in the N-best list, no rescorer can fix it.
-
-    Parameters
-    ----------
-    candidate_sets : list of N-best lists, each a list of word-lists
-    references : list of reference word lists
-
-    Returns
-    -------
-    float  Oracle WER in [0, ∞)
-    """
-    total_edits = 0
-    total_ref = 0
-    for cands, ref in zip(candidate_sets, references):
-        if not ref:
-            continue
-        best_edits = edit_distance(ref, cands[0]) if cands else len(ref)
-        for cand in cands[1:]:
-            d = edit_distance(ref, cand)
-            if d < best_edits:
-                best_edits = d
-        total_edits += best_edits
-        total_ref += len(ref)
-    return total_edits / max(total_ref, 1)
-
-
-def constraint_adherence(
-    predictions: List[List[str]],
-    candidate_sets: List[List[List[str]]],
-) -> float:
-    """
-    Word-level constraint adherence: fraction of predicted words that
-    appear in the candidate set at any position.
-
-    For **rescoring** mode: adherence is 100% by construction since the
-    output is always one of the N-best candidates verbatim.
-
-    For **slot-filling** mode: each word at each position comes from the
-    confusion set for that slot, so adherence is 100% by construction.
-
-    The metric is most useful as a sanity check — any deviation from
-    1.0 indicates a bug in the constrained decoding pipeline.
-    """
-    total_words = 0
-    in_set = 0
-    for pred_words, cand_set in zip(predictions, candidate_sets):
-        all_cand_words = set()
-        for cand in cand_set:
-            for w in cand:
-                all_cand_words.add(w)
-        for w in pred_words:
-            total_words += 1
-            if w in all_cand_words:
-                in_set += 1
-    return in_set / max(total_words, 1)
-
-
-def transcript_adherence(
-    predictions: List[List[str]],
-    candidate_sets: List[List[List[str]]],
-) -> float:
-    """
-    Transcript-level adherence: fraction of predicted transcripts that
-    exactly match one of the N-best candidates.
-
-    This is a stricter metric than word-level adherence. For rescoring
-    mode, it should be 100% (output is always an N-best candidate).
-    For slot-filling mode, it may be < 100% since the output is
-    constructed word-by-word from confusion sets and may not match any
-    single N-best candidate exactly.
-
-    Returns
-    -------
-    float in [0, 1]
-    """
-    if not predictions:
-        return 1.0
-
-    n_match = 0
-    for pred_words, cand_set in zip(predictions, candidate_sets):
-        pred_tuple = tuple(pred_words)
-        if any(tuple(cand) == pred_tuple for cand in cand_set):
-            n_match += 1
-    return n_match / len(predictions)
-
-
-def slot_adherence(
-    predictions: List[List[str]],
-    slot_candidate_sets: List[List[List[str]]],
-) -> float:
-    """
-    Slot-level adherence for slot-filling mode: for each position,
-    check that the predicted word is in the confusion set for that slot.
-
-    Parameters
-    ----------
-    predictions : list of word lists
-    slot_candidate_sets : list of per-utterance per-slot candidate lists
-        slot_candidate_sets[i][j] = list of candidate words for position j
-
-    Returns
-    -------
-    float in [0, 1]
-    """
-    total_slots = 0
-    in_set = 0
-    for pred_words, per_slot_cands in zip(predictions, slot_candidate_sets):
-        for j, w in enumerate(pred_words):
-            total_slots += 1
-            if j < len(per_slot_cands) and w in per_slot_cands[j]:
-                in_set += 1
-    return in_set / max(total_slots, 1)
-
-
-# ======================================================================
-# Confidence-bucket analysis
-# ======================================================================
-
-
-def wer_by_confidence_bucket(
-    word_predictions: List[str],
-    word_references: List[str],
-    word_confidences: List[float],
-    n_buckets: int = 5,
-) -> List[Tuple[float, float, float, int]]:
-    """
-    Break down WER improvement by neural confidence buckets.
-
-    Returns list of (bucket_low, bucket_high, bucket_wer, n_words).
-    """
-    if not word_confidences:
-        return []
-
-    confs = np.array(word_confidences)
-    bucket_edges = np.linspace(0, 1, n_buckets + 1)
-
-    results: List[Tuple[float, float, float, int]] = []
-    for i in range(n_buckets):
-        lo, hi = bucket_edges[i], bucket_edges[i + 1]
-        mask = (confs >= lo) & (confs < hi if i < n_buckets - 1 else confs <= hi)
-        indices = np.where(mask)[0]
-
-        if len(indices) == 0:
-            results.append((lo, hi, 0.0, 0))
-            continue
-
-        bucket_preds = [word_predictions[j] for j in indices]
-        bucket_refs = [word_references[j] for j in indices]
-
-        edits = sum(1 for p, r in zip(bucket_preds, bucket_refs) if p != r)
-        bucket_wer = edits / max(len(bucket_refs), 1)
-        results.append((lo, hi, bucket_wer, len(indices)))
+        ed = editdistance.eval(ref_words, pred_words)
+        n_ref = len(ref_words)
+        wer = ed / max(n_ref, 1)
+        results.append((wer, ed, n_ref))
 
     return results
 
 
-# ======================================================================
-# Evaluation report
-# ======================================================================
-
-
-@dataclass
-class EvalReport:
-    """Structured evaluation report for one decoding configuration."""
-
-    name: str = ""
-    wer: float = 0.0
-    cer: float = 0.0
-    per: float = 0.0
-    constraint_adherence: float = 0.0
-    transcript_adherence: float = 0.0  # entire output matches one N-best candidate
-    slot_adherence: float = 0.0  # per-slot word from confusion set (slot-filling only)
-    hallucination_rate_word: float = 0.0  # 1 - word-level constraint adherence
-    hallucination_rate_transcript: float = 0.0  # 1 - transcript adherence
-    runtime_seconds: float = 0.0
-    n_parameters: int = 0
-    confidence_breakdown: List[Tuple[float, float, float, int]] = field(
-        default_factory=list
-    )
-    extra: Dict[str, float] = field(default_factory=dict)
-
-    def summary(self) -> str:
-        lines = [
-            f"=== {self.name} ===",
-            f"  WER:                       {self.wer:.4f}",
-            f"  CER:                       {self.cer:.4f}",
-            f"  PER:                       {self.per:.4f}",
-            f"  Constraint adherence (word):       {self.constraint_adherence:.4f}",
-            f"  Constraint adherence (transcript): {self.transcript_adherence:.4f}",
-            f"  Slot adherence:                    {self.slot_adherence:.4f}",
-            f"  Hallucination rate (word):         {self.hallucination_rate_word:.4f}",
-            f"  Hallucination rate (transcript):   {self.hallucination_rate_transcript:.4f}",
-            f"  Runtime (s):               {self.runtime_seconds:.2f}",
-            f"  Parameters:                {self.n_parameters:,}",
-        ]
-        if self.confidence_breakdown:
-            lines.append("  Confidence buckets:")
-            for lo, hi, bwer, n in self.confidence_breakdown:
-                lines.append(f"    [{lo:.2f}, {hi:.2f}): WER={bwer:.4f}  n={n}")
-        for k, v in self.extra.items():
-            lines.append(f"  {k}: {v}")
-        return "\n".join(lines)
-
-
-def run_ablation_ladder(
-    reports: List[EvalReport],
-) -> str:
+def oracle_wer(
+    nbest_lists: List[List[str]],
+    references: List[str],
+    clean: bool = True,
+) -> float:
     """
-    Format a comparison table across multiple decoding configurations.
+    Compute oracle WER: for each utterance, pick the n-best candidate
+    with the lowest WER against the reference.
+
+    Parameters
+    ----------
+    nbest_lists : list of list of str
+        For each utterance, a list of candidate sentences.
+    references : list of str
+        Reference sentences.
+
+    Returns
+    -------
+    float
+        Oracle WER.
     """
-    header = (
-        f"{'Method':<40} {'WER':>8} {'Oracle':>8} {'CER':>8} {'PER':>8} "
-        f"{'C-Adh':>8} {'T-Adh':>8} {'H-Rate':>8} "
-        f"{'Time(s)':>10} {'Params':>12}"
-    )
-    lines = [header, "-" * len(header)]
-    for r in reports:
-        ow = r.extra.get("oracle_wer", float("nan"))
-        lines.append(
-            f"{r.name:<40} {r.wer:>8.4f} {ow:>8.4f} {r.cer:>8.4f} {r.per:>8.4f} "
-            f"{r.constraint_adherence:>8.4f} {r.transcript_adherence:>8.4f} "
-            f"{r.hallucination_rate_transcript:>8.4f} "
-            f"{r.runtime_seconds:>10.2f} {r.n_parameters:>12,}"
-        )
-    return "\n".join(lines)
+    total_edit_distance = 0
+    total_ref_words = 0
+
+    for candidates, ref in zip(nbest_lists, references):
+        if clean:
+            ref = remove_punctuation(ref)
+        ref_words = ref.strip().split()
+        n_ref = len(ref_words)
+
+        best_ed = n_ref  # worst case: all deletions
+        for cand in candidates:
+            if clean:
+                cand = remove_punctuation(cand)
+            cand_words = cand.strip().split()
+            ed = editdistance.eval(ref_words, cand_words)
+            if ed < best_ed:
+                best_ed = ed
+
+        total_edit_distance += best_ed
+        total_ref_words += n_ref
+
+    return total_edit_distance / max(total_ref_words, 1)

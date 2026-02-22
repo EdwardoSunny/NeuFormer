@@ -410,7 +410,7 @@ def trainModel(args):
 
             # Save best model
             is_best = False
-            if len(testCER) > 0 and cer < np.min(testCER):
+            if len(testCER) == 0 or cer < np.min(testCER):
                 torch.save(model.state_dict(), args["outputDir"] + "/modelWeights")
                 is_best = True
                 wandb.log({"eval/best_cer": cer}, step=batch)
