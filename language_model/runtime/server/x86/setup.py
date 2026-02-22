@@ -42,11 +42,15 @@ class CMakeBuild(build_ext):
         # Set Python_EXECUTABLE instead if you use PYBIND11_FINDPYTHON
         # EXAMPLE_VERSION_INFO shows you how to pass a value into the C++ code
         # from Python.
+        # Point CMake at the conda env so it can find zlib, etc.
+        conda_prefix = os.environ.get("CONDA_PREFIX", "")
         cmake_args = [
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}",
             f"-DPYTHON_EXECUTABLE={sys.executable}",
             f"-DCMAKE_BUILD_TYPE={cfg}",  # not used on MSVC, but no harm
         ]
+        if conda_prefix:
+            cmake_args += [f"-DCMAKE_PREFIX_PATH={conda_prefix}"]
         build_args = []
         # Adding CMake arguments set as environment variable
         # (needed e.g. to build for ARM OSx on conda-forge)
@@ -71,7 +75,6 @@ class CMakeBuild(build_ext):
                     pass
 
         else:
-
             # Single config generators are handled "normally"
             single_config = any(x in cmake_generator for x in {"NMake", "Ninja"})
 
@@ -106,7 +109,7 @@ class CMakeBuild(build_ext):
                 # CMake 3.12+ only.
                 build_args += [f"-j{self.parallel}"]
 
-        build_args += ['--target', 'lm_decoder']
+        build_args += ["--target", "lm_decoder"]
 
         if not os.path.exists(self.build_temp):
             os.makedirs(self.build_temp)

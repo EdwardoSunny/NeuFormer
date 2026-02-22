@@ -58,7 +58,18 @@ if [ "$GCC_MAJOR" -lt 10 ]; then
     exit 1
 fi
 
-echo "Prerequisites OK (CMake, GCC $GCC_VERSION)"
+# Check zlib dev headers
+if ! dpkg -s zlib1g-dev &> /dev/null && ! rpm -q zlib-devel &> /dev/null; then
+    # Try a direct check as fallback (works on any distro)
+    if ! find /usr/include -name "zlib.h" -print -quit 2>/dev/null | grep -q .; then
+        echo "ERROR: zlib development headers not found."
+        echo "       Ubuntu/Debian: sudo apt install zlib1g-dev"
+        echo "       CentOS/RHEL:   sudo yum install zlib-devel"
+        exit 1
+    fi
+fi
+
+echo "Prerequisites OK (CMake, GCC $GCC_VERSION, zlib)"
 
 # Prefer mamba if available, fall back to conda
 if command -v mamba &> /dev/null; then
