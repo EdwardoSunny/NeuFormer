@@ -534,28 +534,30 @@ class DecodePipeline:
 
         rescored = []
         for i, wh in enumerate(candidates):
-            T_frames = (
-                log_probs.shape[0]
-                if length is None
-                else min(log_probs.shape[0], length)
-            )
-
-            ctc_score = wh.ctc_log_prob
-            ngram_score_ln = ngram_scores_raw[i] * LOG10
-            llm_score = llm_scores[i]
-
-            # Length-normalize LLM score (per word)
             n_words = max(len(wh.words), 1)
-            llm_score_norm = llm_score * n_words  # score_batch returns per-token; undo
 
-            # Actually, llm.score_batch returns per-token normalized scores.
-            # The paper doesn't specify length normalization for LLM.
-            # We'll use the raw (non-normalized) score for fairer comparison.
-            # llm.score() returns length-normalized, so multiply by n_words to undo.
-            llm_score_raw = llm_score * n_words
+            # Normalize all scores per-word for consistent scale:
+            #
+            # CTC: total log-prob (natural log) → per-word
+            ctc_per_word = wh.ctc_log_prob / n_words
+            #
+            # N-gram: total log10 score → per-word, converted to ln
+            ngram_per_word_ln = (ngram_scores_raw[i] / n_words) * LOG10
+            #
+            # LLM: score_batch() returns per-BPE-token normalized ln score.
+            # This is already on a per-unit scale, so use directly.
+            # (n_bpe_tokens ≈ n_words for most English text, so this is
+            #  close to per-word. Trying to undo with n_words would be
+            #  wrong since n_bpe_tokens ≠ n_words.)
+            llm_per_unit = llm_scores[i]
 
+            # Paper's formula (all per-word scale):
+            #   score = alpha * log P_enc + beta * log P_ngram
+            #         + (1-beta) * log P_LLM
             combined = (
-                alpha * ctc_score + beta * ngram_score_ln + (1 - beta) * llm_score_raw
+                alpha * ctc_per_word
+                + beta * ngram_per_word_ln
+                + (1 - beta) * llm_per_unit
             )
 
             rescored.append((wh.words, combined, i))
