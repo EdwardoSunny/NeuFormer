@@ -171,3 +171,5 @@ language_model/runtime/server/x86/fc_base/
 language_model/runtime/server/x86/dist/
 language_model/runtime/server/x86/lm_decoder.egg*
 language_model/runtime/server/x86/lm_decoder.cpython*
+
+language_model/pretrained_language_models

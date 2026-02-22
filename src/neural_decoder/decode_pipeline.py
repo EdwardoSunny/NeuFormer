@@ -55,12 +55,15 @@ class PipelineConfig:
     length_penalty: float = 0.0
     nbest: int = 100
     blank_penalty: float = 9.0
-    rescore: bool = True  # Rescore with unpruned G.fst
+    rescore: bool = False  # Rescore with unpruned G.fst (requires G_no_prune.fst)
 
     # ---- N-best augmentation ----
     augment_nbest: bool = True
     top_candidates_to_augment: int = 20
     score_penalty_percent: float = 0.01
+
+    # ---- Input format ----
+    is_log_probs: bool = False  # True if model outputs log_softmax (e.g. Conformer)
 
     # ---- LLM rescoring ----
     do_llm: bool = True
@@ -215,6 +218,7 @@ class DecodePipeline:
             logits,
             blank_penalty=self.config.blank_penalty,
             rescore=self.config.rescore,
+            is_log_probs=self.config.is_log_probs,
         )
         result.ngram_nbest = ngram_results
         result.ngram_time = time.time() - t_ngram

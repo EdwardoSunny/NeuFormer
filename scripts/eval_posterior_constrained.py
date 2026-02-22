@@ -130,16 +130,10 @@ def extract_logits(model, args, data_partition, loaded_data, device="cuda"):
             with torch.no_grad():
                 if is_conformer:
                     log_probs, out_lens, _ = model(X, day_t, X_len)
-                    # log_probs: [T, B, C] → [T, C]
-                    # Note: the conformer outputs log_softmax, but the
-                    # WFST decoder (lm_decoder.DecodeNumpy) expects raw
-                    # logits and applies log_softmax internally.
-                    # So we pass the log_probs as-is; DecodeNumpy will
-                    # apply log_softmax again, but since log_softmax of
-                    # log_softmax is close to log_softmax for peaked
-                    # distributions, this works in practice.
-                    # For best results, modify the conformer to output
-                    # raw logits, or use DecodeNumpyLogProbs.
+                    # log_probs shape: [T, B, C] → take [T, C] for batch=0
+                    # The Conformer outputs log_softmax. The pipeline uses
+                    # DecodeNumpyLogProbs (via is_log_probs=True) which
+                    # skips the internal log_softmax in the C++ decoder.
                     lp = log_probs[:, 0, :].cpu().numpy()
                     out_len = out_lens[0].cpu().item()
                 else:
@@ -188,14 +182,14 @@ def main():
     parser.add_argument(
         "--model_path",
         type=str,
-        required=True,
-        help="Path to trained model directory",
+        default=None,
+        help="Path to trained model directory (not needed with --load_logits)",
     )
     parser.add_argument(
         "--dataset_path",
         type=str,
-        required=True,
-        help="Path to ptDecoder_ctc pickle",
+        default=None,
+        help="Path to ptDecoder_ctc pickle (not needed with --load_logits)",
     )
     parser.add_argument(
         "--partition",
@@ -209,6 +203,20 @@ def main():
         type=str,
         default="cuda",
         help="Device for Conformer inference",
+    )
+
+    # ---- Logit caching (for split env workflow) ----
+    parser.add_argument(
+        "--save_logits",
+        type=str,
+        default=None,
+        help="Save extracted logits to this pickle path and exit (no decoding)",
+    )
+    parser.add_argument(
+        "--load_logits",
+        type=str,
+        default=None,
+        help="Load pre-extracted logits from this pickle path (skip model inference)",
     )
 
     # ---- WFST N-gram decoder ----
@@ -226,10 +234,8 @@ def main():
     parser.add_argument(
         "--rescore",
         action="store_true",
-        default=True,
-        help="Rescore with unpruned G.fst",
+        help="Rescore with unpruned G.fst (requires G_no_prune.fst in lm_path)",
     )
-    parser.add_argument("--no_rescore", action="store_false", dest="rescore")
 
     # ---- N-best augmentation ----
     parser.add_argument(
@@ -287,6 +293,7 @@ def main():
     print(f"  Got {len(utterances)} utterances")
 
     # Setup decode pipeline
+    # Conformer outputs log_softmax; GRU outputs raw logits
     config = PipelineConfig(
         lm_path=input_args.lm_path,
         acoustic_scale=input_args.acoustic_scale,
@@ -295,6 +302,7 @@ def main():
         lattice_beam=input_args.lattice_beam,
         nbest=input_args.nbest,
         rescore=input_args.rescore,
+        is_log_probs=is_conformer,
         augment_nbest=not input_args.no_augment,
         top_candidates_to_augment=input_args.top_candidates_to_augment,
         score_penalty_percent=input_args.score_penalty_percent,

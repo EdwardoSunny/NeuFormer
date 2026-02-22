@@ -175,6 +175,7 @@ class NgramWFSTDecoder:
         logits: np.ndarray,
         blank_penalty: float = 9.0,
         rescore: bool = True,
+        is_log_probs: bool = False,
     ) -> List[NgramDecodeResult]:
         """
         Decode a single utterance.
@@ -182,22 +183,22 @@ class NgramWFSTDecoder:
         Parameters
         ----------
         logits : np.ndarray, shape [T, 41]
-            Logits or log-probs from the Conformer.
+            Logits or log-probs from the model.
             Expected order: [BLANK, SIL, phonemes...] (Kaldi order).
             Use ``rearrange_logits()`` to convert from model order.
-
-            NOTE: The Conformer outputs log_softmax (log-probs), but
-            ``DecodeNumpy`` applies log_softmax again internally. For
-            peaked distributions (typical of trained CTC models) this
-            still works well in practice. If this becomes an issue,
-            use ``DecodeNumpyLogProbs`` (if available in your build)
-            which skips the internal softmax.
         blank_penalty : float
-            Penalty applied to blank emissions (as log(penalty)).
+            Penalty applied to blank emissions.
             Higher values encourage more non-blank emissions.
             Paper default: 9.0 for offline, 7.0 for online.
         rescore : bool
             Whether to rescore with unpruned G.fst if available.
+        is_log_probs : bool
+            If True, input is already log-probabilities (e.g. from
+            a model that applies log_softmax). Uses ``DecodeNumpyLogProbs``
+            which skips the internal log_softmax. Blank penalty is applied
+            manually before decoding.
+            If False (default), input is raw logits and ``DecodeNumpy``
+            applies log_softmax internally.
 
         Returns
         -------
@@ -206,19 +207,27 @@ class NgramWFSTDecoder:
         """
         self._decoder.Reset()
 
-        # lm_decoder.DecodeNumpy expects:
-        #   logits: [T, 41] float32
-        #   log_priors: [T, 41] float32 (zeros = no prior subtraction)
-        #   blank_penalty: float (log of the penalty value)
         logits = np.ascontiguousarray(logits, dtype=np.float32)
-        log_priors = np.zeros_like(logits)
 
-        self._lm_decoder.DecodeNumpy(
-            self._decoder,
-            logits,
-            log_priors,
-            np.log(blank_penalty),
-        )
+        if is_log_probs:
+            # Input is already log-probabilities (e.g. from Conformer
+            # which applies log_softmax). Use DecodeNumpyLogProbs which
+            # passes log-probs directly to the decoder without applying
+            # log_softmax again.
+            # We apply blank_penalty manually here.
+            log_probs = logits.copy()
+            log_probs[:, 0] -= np.log(blank_penalty)
+            self._lm_decoder.DecodeNumpyLogProbs(self._decoder, log_probs)
+        else:
+            # Input is raw logits. DecodeNumpy applies log_softmax,
+            # subtracts log_priors, and applies blank_penalty internally.
+            log_priors = np.zeros_like(logits)
+            self._lm_decoder.DecodeNumpy(
+                self._decoder,
+                logits,
+                log_priors,
+                np.log(blank_penalty),
+            )
 
         self._decoder.FinishDecoding()
 
@@ -243,6 +252,7 @@ class NgramWFSTDecoder:
         self,
         logits: np.ndarray,
         blank_penalty: float = 9.0,
+        is_log_probs: bool = False,
     ) -> str:
         """
         Feed logits incrementally (for streaming/online use).
@@ -252,9 +262,11 @@ class NgramWFSTDecoder:
         Parameters
         ----------
         logits : np.ndarray, shape [T, 41]
-            A chunk of logits.
+            A chunk of logits or log-probs.
         blank_penalty : float
             Blank penalty.
+        is_log_probs : bool
+            If True, input is already log-probabilities.
 
         Returns
         -------
@@ -262,14 +274,19 @@ class NgramWFSTDecoder:
             Current partial decoded sentence.
         """
         logits = np.ascontiguousarray(logits, dtype=np.float32)
-        log_priors = np.zeros_like(logits)
 
-        self._lm_decoder.DecodeNumpy(
-            self._decoder,
-            logits,
-            log_priors,
-            np.log(blank_penalty),
-        )
+        if is_log_probs:
+            log_probs = logits.copy()
+            log_probs[:, 0] -= np.log(blank_penalty)
+            self._lm_decoder.DecodeNumpyLogProbs(self._decoder, log_probs)
+        else:
+            log_priors = np.zeros_like(logits)
+            self._lm_decoder.DecodeNumpy(
+                self._decoder,
+                logits,
+                log_priors,
+                np.log(blank_penalty),
+            )
 
         if self._decoder.DecodedSomething():
             return self._decoder.result()[0].sentence.strip()
