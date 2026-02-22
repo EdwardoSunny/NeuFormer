@@ -113,13 +113,13 @@ if(NOT MSVC)
     URL_HASH          SHA256=b720357a464f42e181d7e33f60867b54044007f50baedc8f4458a3926f4a5a78
     SOURCE_DIR        ${openfst_SOURCE_DIR}
     BINARY_DIR        ${openfst_BINARY_DIR}
+    PATCH_COMMAND     ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/patch/openfst ${openfst_SOURCE_DIR}
     CONFIGURE_COMMAND ${openfst_SOURCE_DIR}/configure --prefix=${openfst_PREFIX_DIR}
                         "CPPFLAGS=-I${gflags_BINARY_DIR}/include -I${glog_SOURCE_DIR}/src -I${glog_BINARY_DIR} -D_GLIBCXX_USE_CXX11_ABI=0"
                         "CXXFLAGS=-fPIC -fcommon -D_GLIBCXX_USE_CXX11_ABI=0"
                         "CFLAGS=-fPIC -fcommon"
                         "LDFLAGS=-L${gflags_BINARY_DIR} -L${glog_BINARY_DIR} -Wl,--allow-multiple-definition"
                         "LIBS=-lgflags_nothreads -lglog -lpthread"
-    COMMAND           ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/patch/openfst ${openfst_SOURCE_DIR}
     BUILD_COMMAND     make -j 4
   )
   add_dependencies(openfst gflags glog)
