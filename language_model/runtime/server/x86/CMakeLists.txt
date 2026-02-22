@@ -117,7 +117,7 @@ if(NOT MSVC)
                         "CPPFLAGS=-I${gflags_BINARY_DIR}/include -I${glog_SOURCE_DIR}/src -I${glog_BINARY_DIR} -D_GLIBCXX_USE_CXX11_ABI=0"
                         "CXXFLAGS=-fPIC -fcommon -D_GLIBCXX_USE_CXX11_ABI=0"
                         "CFLAGS=-fPIC -fcommon"
-                        "LDFLAGS=-L${gflags_BINARY_DIR} -L${glog_BINARY_DIR}"
+                        "LDFLAGS=-L${gflags_BINARY_DIR} -L${glog_BINARY_DIR} -Wl,--allow-multiple-definition"
                         "LIBS=-lgflags_nothreads -lglog -lpthread"
     COMMAND           ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/patch/openfst ${openfst_SOURCE_DIR}
     BUILD_COMMAND     make -j 4
