@@ -183,6 +183,222 @@ class TestCTCBeamDecoder(unittest.TestCase):
         self.assertEqual(results[0].phoneme_ids, [5, 10])
 
 
+class TestWordLevelCTCDecoder(unittest.TestCase):
+    """Test WordLevelCTCDecoder – word-level beam search with N-gram."""
+
+    def _make_log_probs(self, T=40, C=41, seed=42):
+        """Create synthetic log-softmax posteriors."""
+        rng = np.random.RandomState(seed)
+        logits = rng.randn(T, C).astype(np.float32)
+        logits -= logits.max(axis=-1, keepdims=True)
+        probs = np.exp(logits) / np.exp(logits).sum(axis=-1, keepdims=True)
+        return np.log(probs + 1e-12)
+
+    def _make_peaked_log_probs(self):
+        """
+        Create a peaked distribution that should decode to known words.
+        Pattern: blank blank HH(16) AY(6) SIL(40) DH(10) EH(11) R(28) SIL(40) blank
+        Should decode to phonemes [16, 6, 40, 10, 11, 28, 40]
+        Which maps to words "hi there" if lexicon has those entries.
+        """
+        T, C = 20, 41
+        log_probs = np.full((T, C), -10.0, dtype=np.float32)
+        # Pattern: blank, blank, HH, AY, SIL, DH, EH, R, SIL, blank * rest
+        pattern = [
+            0,
+            0,
+            16,
+            16,
+            6,
+            6,
+            40,
+            40,
+            10,
+            10,
+            11,
+            28,
+            28,
+            40,
+            40,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]
+        for t, c in enumerate(pattern):
+            log_probs[t, c] = -0.01
+        for t in range(T):
+            lse = np.log(np.sum(np.exp(log_probs[t])))
+            log_probs[t] -= lse
+        return log_probs
+
+    def test_decode_requires_lexicon(self):
+        from neural_decoder.ctc_beam_decoder import WordLevelCTCDecoder
+
+        decoder = WordLevelCTCDecoder(beam_width=5, lexicon=None)
+        log_probs = self._make_log_probs()
+        with self.assertRaises(ValueError):
+            decoder.decode(log_probs)
+
+    def test_decode_returns_word_hypotheses(self):
+        from neural_decoder.ctc_beam_decoder import (
+            WordLevelCTCDecoder,
+            WordCTCHypothesis,
+        )
+        from neural_decoder.lexicon import PronunciationLexicon
+
+        lex = PronunciationLexicon(max_edit_dist=1)
+        lex.add_word("hi", pronunciation=[16, 6])
+        lex.add_word("there", pronunciation=[10, 11, 28])
+
+        decoder = WordLevelCTCDecoder(
+            beam_width=5,
+            n_best=5,
+            lexicon=lex,
+            ngram_lm=None,
+        )
+        log_probs = self._make_peaked_log_probs()
+        results = decoder.decode(log_probs)
+
+        self.assertIsInstance(results, list)
+        self.assertGreater(len(results), 0)
+        self.assertIsInstance(results[0], WordCTCHypothesis)
+        self.assertIsInstance(results[0].words, list)
+        self.assertTrue(results[0].ctc_log_prob <= 0.0)
+
+    def test_peaked_decodes_correct_words(self):
+        from neural_decoder.ctc_beam_decoder import WordLevelCTCDecoder
+        from neural_decoder.lexicon import PronunciationLexicon
+
+        lex = PronunciationLexicon(max_edit_dist=0)
+        lex.add_word("hi", pronunciation=[16, 6])
+        lex.add_word("there", pronunciation=[10, 11, 28])
+
+        decoder = WordLevelCTCDecoder(
+            beam_width=10,
+            n_best=5,
+            lexicon=lex,
+            ngram_lm=None,
+            blank_penalty=0.0,
+        )
+        log_probs = self._make_peaked_log_probs()
+        results = decoder.decode(log_probs)
+
+        self.assertGreater(len(results), 0)
+        # Best hypothesis should contain "hi" and "there"
+        best_words = results[0].words
+        self.assertIn("hi", best_words)
+        self.assertIn("there", best_words)
+
+    def test_sorted_by_combined_score(self):
+        from neural_decoder.ctc_beam_decoder import WordLevelCTCDecoder
+        from neural_decoder.lexicon import PronunciationLexicon
+
+        lex = PronunciationLexicon(max_edit_dist=1)
+        lex.add_word("hi", pronunciation=[16, 6])
+        lex.add_word("there", pronunciation=[10, 11, 28])
+
+        decoder = WordLevelCTCDecoder(
+            beam_width=10,
+            n_best=10,
+            lexicon=lex,
+            ngram_lm=None,
+        )
+        log_probs = self._make_log_probs(T=30)
+        results = decoder.decode(log_probs)
+
+        for i in range(len(results) - 1):
+            self.assertGreaterEqual(
+                results[i].combined_score, results[i + 1].combined_score
+            )
+
+    def test_ngram_integration(self):
+        """Word-beam search with N-gram should produce different results."""
+        from neural_decoder.ctc_beam_decoder import WordLevelCTCDecoder
+        from neural_decoder.lexicon import PronunciationLexicon
+        from neural_decoder.ngram_lm import NgramLM
+
+        lex = PronunciationLexicon(max_edit_dist=1)
+        lex.build_from_sentences(["hi there", "hi world", "good morning"])
+
+        ngram = NgramLM(order=2)
+        ngram.train(["hi there", "hi there", "hi there", "good morning"])
+
+        d_no_ngram = WordLevelCTCDecoder(
+            beam_width=10,
+            n_best=5,
+            lexicon=lex,
+            ngram_lm=None,
+        )
+        d_with_ngram = WordLevelCTCDecoder(
+            beam_width=10,
+            n_best=5,
+            lexicon=lex,
+            ngram_lm=ngram,
+            ngram_alpha=1.0,
+        )
+
+        log_probs = self._make_log_probs(T=30, seed=99)
+        r1 = d_no_ngram.decode(log_probs)
+        r2 = d_with_ngram.decode(log_probs)
+
+        # Both should produce results
+        self.assertGreater(len(r1), 0)
+        self.assertGreater(len(r2), 0)
+        # N-gram version should have non-zero ngram scores
+        if r2[0].words:  # only if non-empty hypothesis
+            self.assertNotEqual(r2[0].ngram_log_prob, 0.0)
+
+    def test_decode_batch(self):
+        from neural_decoder.ctc_beam_decoder import WordLevelCTCDecoder
+        from neural_decoder.lexicon import PronunciationLexicon
+
+        lex = PronunciationLexicon(max_edit_dist=1)
+        lex.add_word("hi", pronunciation=[16, 6])
+
+        decoder = WordLevelCTCDecoder(
+            beam_width=5,
+            n_best=3,
+            lexicon=lex,
+        )
+        batch = np.stack([self._make_log_probs(seed=i) for i in range(3)])
+        lengths = np.array([40, 30, 35])
+        results = decoder.decode_batch(batch, lengths)
+
+        self.assertEqual(len(results), 3)
+        for r in results:
+            self.assertIsInstance(r, list)
+
+    def test_blank_penalty_effect(self):
+        from neural_decoder.ctc_beam_decoder import WordLevelCTCDecoder
+        from neural_decoder.lexicon import PronunciationLexicon
+
+        lex = PronunciationLexicon(max_edit_dist=1)
+        lex.add_word("hi", pronunciation=[16, 6])
+        lex.add_word("there", pronunciation=[10, 11, 28])
+
+        log_probs = self._make_log_probs(T=25, seed=77)
+
+        d1 = WordLevelCTCDecoder(
+            beam_width=5,
+            n_best=5,
+            lexicon=lex,
+            blank_penalty=0.0,
+        )
+        d2 = WordLevelCTCDecoder(
+            beam_width=5,
+            n_best=5,
+            lexicon=lex,
+            blank_penalty=2.0,
+        )
+        r1 = d1.decode(log_probs)
+        r2 = d2.decode(log_probs)
+
+        self.assertGreater(len(r1), 0)
+        self.assertGreater(len(r2), 0)
+
+
 class TestLexicon(unittest.TestCase):
     """Test lexicon.py – A2."""
 

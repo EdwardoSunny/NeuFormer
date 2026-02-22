@@ -14,6 +14,7 @@ Usage
 """
 
 import argparse
+import math
 import os
 import pickle
 import re
@@ -312,19 +313,40 @@ def main():
     parser.add_argument(
         "--device", type=str, default="cuda", help="Device for neural model"
     )
-    parser.add_argument("--beam_width", type=int, default=25)
-    parser.add_argument("--n_best", type=int, default=10)
+    parser.add_argument(
+        "--beam_width", type=int, default=18, help="Beam width (paper: 18)"
+    )
+    parser.add_argument(
+        "--n_best",
+        type=int,
+        default=100,
+        help="N-best list size (paper: 100 for offline)",
+    )
+    parser.add_argument(
+        "--alpha", type=float, default=0.8, help="CTC weight (paper: 0.8)"
+    )
+    parser.add_argument(
+        "--beta", type=float, default=0.5, help="N-gram vs LLM mixture (paper: 0.5)"
+    )
+    parser.add_argument(
+        "--blank_penalty",
+        type=float,
+        default=None,
+        help="Blank penalty (default: log(2) for online, log(7) for offline)",
+    )
     parser.add_argument(
         "--mode",
         type=str,
-        default="constrained_rescore",
+        default="online",
         choices=[
+            "online",
+            "offline",
             "neural_only",
             "unconstrained_rescore",
             "constrained_rescore",
             "slot_filling",
         ],
-        help="Decoding mode",
+        help="Decoding mode (online=paper default, offline=paper offline+LLM)",
     )
     parser.add_argument(
         "--ablation", action="store_true", help="Run full ablation ladder"
@@ -422,24 +444,48 @@ def main():
     training_sentences = get_training_sentences(loaded_data)
     print(f"  Lexicon will be built from {len(training_sentences)} training sentences")
 
+    # Determine blank penalty: mode-dependent default
+    if input_args.blank_penalty is not None:
+        blank_penalty = input_args.blank_penalty
+    elif input_args.mode == "offline":
+        blank_penalty = math.log(7)  # ≈ 1.9459
+    else:
+        blank_penalty = math.log(2)  # ≈ 0.693
+
+    # Determine N-gram order: mode-dependent default
+    ngram_order = input_args.ngram_order
+    if input_args.mode == "online" and ngram_order == 5:
+        ngram_order = 3  # online default is 3-gram
+
     # Setup pipeline
     config = PipelineConfig(
+        decode_mode=input_args.mode,
         beam_width=input_args.beam_width,
         n_best=input_args.n_best,
+        blank_penalty=blank_penalty,
+        alpha=input_args.alpha,
+        beta=input_args.beta,
+        word_beam_width=input_args.beam_width,
+        ngram_order=ngram_order,
+        use_ngram=not input_args.no_ngram,
+        ngram_weight=input_args.ngram_weight,
+        # Offline-specific
+        offline_ngram_order=5,
+        offline_blank_penalty=math.log(7),
+        offline_top_k=100,
+        # LLM (only loaded for offline mode)
         llm_model_name=input_args.llm_model,
         llm_device=input_args.llm_device,
-        decode_mode=input_args.mode,
+        llm_load_in_8bit=True,
+        # Legacy params
         lambda_neural=input_args.lambda_neural,
         lambda_lm=input_args.lambda_lm,
+        lambda_ngram=input_args.lambda_ngram,
         gamma_constraint=input_args.gamma_constraint,
         length_penalty_beta=input_args.length_penalty_beta,
         high_confidence_threshold=input_args.high_confidence_threshold,
         normalize_scores=input_args.normalize_scores,
         two_pass_top_k=input_args.two_pass_top_k,
-        use_ngram=not input_args.no_ngram,
-        ngram_order=input_args.ngram_order,
-        ngram_weight=input_args.ngram_weight,
-        lambda_ngram=input_args.lambda_ngram,
     )
 
     pipeline = DecodePipeline(config)
@@ -503,9 +549,8 @@ def main():
 
         modes = [
             ("1. Neural-only (greedy CTC)", "neural_only"),
-            ("2. + Unconstrained LLM rescore", "unconstrained_rescore"),
-            ("3. + Posterior-constrained LLM", "constrained_rescore"),
-            ("4. + Slot-filling LLM", "slot_filling"),
+            ("2. Online (word-beam + 3-gram)", "online"),
+            ("3. Offline (5-gram + LLM rescore)", "offline"),
         ]
 
         for name, mode in modes:
