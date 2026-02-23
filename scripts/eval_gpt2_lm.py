@@ -183,13 +183,18 @@ def main():
     # Decode
     preds, refs = [], []
     t0 = time.time()
-    for i, utt in enumerate(tqdm(utterances, desc="Decoding", unit="utt")):
+    pbar = tqdm(utterances, desc="Decoding", unit="utt")
+    for i, utt in enumerate(pbar):
         pred = decoder.decode_text(utt["logits"], is_log_probs=is_conf)
         preds.append(pred)
         refs.append(utt["transcription"])
+        # Show running WER in progress bar
+        if any(r.strip() for r in refs):
+            running_wer, _, _ = compute_wer(preds, refs)
+            pbar.set_postfix(WER=f"{100 * running_wer:.1f}%")
         if i < 5:
-            print(f"  [{i}] ref:  {remove_punctuation(refs[-1])}")
-            print(f"       pred: {remove_punctuation(preds[-1])}")
+            tqdm.write(f"  [{i}] ref:  {remove_punctuation(refs[-1])}")
+            tqdm.write(f"       pred: {remove_punctuation(preds[-1])}")
     elapsed = time.time() - t0
 
     # WER
