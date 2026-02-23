@@ -425,7 +425,10 @@ def _convert_numeric_lexicon(src: str, dst: str):
 
     torchaudio ``lexicon.txt`` format::
 
-        WORD PHONEME PHONEME ... |
+        word PHONEME PHONEME ... |
+
+    Words are lowercased to match standard KenLM language models
+    (e.g. LibriSpeech 4-gram) which are trained on lowercase text.
     """
     id2ph = {i + 1: p for i, p in enumerate(PHONE_DEF)}
     id2ph[len(PHONE_DEF) + 1] = SIL_TOKEN  # 40 → |
@@ -435,7 +438,7 @@ def _convert_numeric_lexicon(src: str, dst: str):
             parts = line.split()
             if len(parts) < 2:
                 continue
-            word = parts[0]
+            word = parts[0].lower()
             phones = [id2ph.get(int(t), "") for t in parts[1:]]
             phones = [p for p in phones if p]  # drop unknowns
             if not phones or phones[-1] != SIL_TOKEN:

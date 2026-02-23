@@ -100,11 +100,11 @@ class TestNgramDecoderHelpers(unittest.TestCase):
             with open(dst) as f:
                 lines = f.readlines()
 
-            # TEST should be: TEST AA B |
-            self.assertIn("TEST", lines[0])
+            # TEST should be lowercased: test AA B |
+            self.assertIn("test", lines[0])
             self.assertTrue(lines[0].strip().endswith(SIL_TOKEN))
-            # HI should be: HI HH AA |  (SIL at end, 40 maps to |)
-            self.assertIn("HI", lines[1])
+            # HI should be lowercased: hi HH AA |  (SIL at end, 40 maps to |)
+            self.assertIn("hi", lines[1])
             self.assertTrue(lines[1].strip().endswith(SIL_TOKEN))
 
     def test_find_lm_missing(self):
