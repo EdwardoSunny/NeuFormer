@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 import wandb
 
 from .model import GRUDecoder
@@ -248,7 +249,8 @@ def trainModel(args):
     # instead of next(iter(trainLoader)) which re-creates iterator every batch
     train_iter = iter(trainLoader)
 
-    for batch in range(args["nBatch"]):
+    pbar = tqdm(range(args["nBatch"]), desc="Training", unit="step")
+    for batch in pbar:
         model.train()
 
         try:
@@ -387,7 +389,8 @@ def trainModel(args):
 
         scaler.step(optimizer)
         scaler.update()
-        scheduler.step()
+        if batch > 0 or not use_amp:
+            scheduler.step()
 
         # Update EMA
         if use_ema and ema_state is not None:
@@ -395,7 +398,7 @@ def trainModel(args):
                 for k, v in model.state_dict().items():
                     ema_state[k].mul_(ema_decay).add_(v, alpha=1.0 - ema_decay)
 
-        # Log training metrics every step
+        # Build log dict for this step (train metrics always included)
         current_lr = optimizer.param_groups[0]["lr"]
         log_dict = {
             "train/loss": loss.item(),
@@ -412,7 +415,6 @@ def trainModel(args):
             log_dict["train/phone_loss"] = phone_loss.item()
         if char_loss is not None:
             log_dict["train/char_ctc_loss"] = char_loss.item()
-        wandb.log(log_dict, step=batch)
 
         # Eval
         if batch % 100 == 0:
@@ -445,14 +447,14 @@ def trainModel(args):
                         )
                         pred = logits.log_softmax(2).permute(1, 0, 2)
 
-                    loss = loss_ctc(
+                    eval_loss = loss_ctc(
                         pred,
                         y,
                         adjustedLens,
                         y_len,
                     )
-                    loss = torch.sum(loss)
-                    allLoss.append(loss.cpu().detach().numpy())
+                    eval_loss = torch.sum(eval_loss)
+                    allLoss.append(eval_loss.cpu().detach().numpy())
 
                     # Decode predictions - both models output [T, B, C] at this point
                     for iterIdx in range(pred.shape[1]):  # Iterate over batch dimension
@@ -479,28 +481,32 @@ def trainModel(args):
 
                 endTime = time.time()
                 time_per_batch = (endTime - startTime) / 100
-                print(
+                tqdm.write(
                     f"batch {batch}, ctc loss: {avgDayLoss:>7f}, cer: {cer:>7f}, time/batch: {time_per_batch:>7.3f}"
+                )
+                pbar.set_postfix(
+                    loss=f"{avgDayLoss:.2f}", CER=f"{cer:.4f}", lr=f"{current_lr:.1e}"
                 )
                 startTime = time.time()
 
-                # Log evaluation metrics
-                eval_log_dict = {
-                    "eval/loss": avgDayLoss,
-                    "eval/cer": cer,
-                    "eval/time_per_batch": time_per_batch,
-                    "eval/edit_distance": total_edit_distance,
-                    "eval/sequence_length": total_seq_length,
-                }
-                wandb.log(eval_log_dict, step=batch)
+                # Add eval metrics to the same log dict
+                log_dict.update(
+                    {
+                        "eval/loss": avgDayLoss,
+                        "eval/cer": cer,
+                        "eval/time_per_batch": time_per_batch,
+                        "eval/edit_distance": total_edit_distance,
+                        "eval/sequence_length": total_seq_length,
+                    }
+                )
 
             # Save best model
             is_best = False
             if len(testCER) == 0 or cer < np.min(testCER):
                 torch.save(model.state_dict(), args["outputDir"] + "/modelWeights")
                 is_best = True
-                wandb.log({"eval/best_cer": cer}, step=batch)
-                print(f"  → New best model saved! CER: {cer:.6f}")
+                log_dict["eval/best_cer"] = cer
+                tqdm.write(f"  -> New best model saved! CER: {cer:.6f}")
 
             testLoss.append(avgDayLoss)
             testCER.append(cer)
@@ -515,6 +521,9 @@ def trainModel(args):
             # Restore original (non-EMA) weights for continued training
             if use_ema and ema_state is not None:
                 model.load_state_dict(original_state)
+
+        # Single wandb.log per step (train + eval merged)
+        wandb.log(log_dict, step=batch)
 
     # Log final summary
     final_cer = testCER[-1] if len(testCER) > 0 else float("inf")
