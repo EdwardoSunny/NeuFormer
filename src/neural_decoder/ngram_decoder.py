@@ -533,7 +533,26 @@ class GPT2CTCDecoderLM:
                 self.infos = {}
 
             def _past_kv_to_device(self, pkv, device):
-                return tuple(tuple(t.to(device) for t in layer) for layer in pkv)
+                # transformers >=4.36 returns DynamicCache objects.
+                # In newer versions (5.x) DynamicCache has no .to() method,
+                # so we rebuild the cache by moving each layer's key/value
+                # tensors individually.
+                if hasattr(pkv, "layers"):
+                    from transformers import DynamicCache
+
+                    new_cache = DynamicCache()
+                    for i, layer_obj in enumerate(pkv.layers):
+                        new_cache.update(
+                            layer_obj.keys.to(device),
+                            layer_obj.values.to(device),
+                            i,
+                        )
+                    return new_cache
+                # Legacy path: tuple-of-tuples (transformers <4.36)
+                return tuple(
+                    tuple(t.to(device) if t is not None else None for t in layer)
+                    for layer in pkv
+                )
 
             def start(self, start_with_nothing: bool) -> _LMState:
                 state = _LMState()
