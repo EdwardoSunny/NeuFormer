@@ -1,18 +1,16 @@
 """
-Conformer v3 training script — RoPE + deeper model.
+Conformer v3 training script — v2 architecture + B2T augmentations.
 
-Key changes from v2:
-  - Rotary Position Embeddings (RoPE) replacing sinusoidal PE
-  - 10 layers (was 8) for more model depth
-  - 30k steps (same as v2 — 50k was overfitting)
-  - Same LR/dropout as v2 (conservative — deeper model already adds capacity)
-  - Slightly stronger SpecAugment + noise
+v2 at step 5100 had 0.18 CER. Previous v3 attempts with RoPE + 10 layers
+plateaued at 0.24 CER at step 5000 — deeper model + RoPE hurt on this dataset.
 
-All v2 improvements are retained:
-  - 4x FF expansion, linearly increasing DropPath
-  - DropPath on ConvModule, AutoEncoder residual+LN
-  - Proper data iteration, cosine to lrEnd
-  - AMP, EMA
+Strategy: keep v2's proven architecture (8 layers, no RoPE) and only add
+the B2T-inspired augmentations that are low-risk:
+  - Multiplicative noise (simulates electrode gain drift)
+  - Random temporal shift (alignment robustness)
+  - Slightly stronger SpecAugment
+
+Everything else identical to v2.
 """
 
 modelName = "conformer_v3"
@@ -21,7 +19,7 @@ args = {}
 args["outputDir"] = "/data1/edward/Neural-Speech-Decoder/logs/speech_logs/" + modelName
 args["datasetPath"] = "/data1/edward/Neural-Speech-Decoder/ptDecoder_ctc"
 args["batchSize"] = 64
-args["nBatch"] = 30000  # Same as v2 — 50k was overfitting
+args["nBatch"] = 30000  # Same as v2
 args["seed"] = 42
 
 # Wandb logging
@@ -41,33 +39,35 @@ args["temporal_kernel"] = 32
 args["temporal_stride"] = 4
 args["gaussian_smooth_width"] = 2.0
 
-# Data augmentation — slightly stronger than v2
-args["whiteNoiseSD"] = 0.9  # Slight increase from 0.8
-args["constantOffsetSD"] = 0.25  # Slight increase from 0.2
+# Data augmentation — v2 baseline + B2T augmentations
+args["whiteNoiseSD"] = 0.8  # Same as v2
+args["constantOffsetSD"] = 0.2  # Same as v2
+args["mult_noise_sd"] = 0.1  # NEW: multiplicative noise from B2T
+args["temporal_shift_max"] = 7  # NEW: random temporal shift from B2T
 
-# Conformer architecture (v3)
+# Conformer architecture — identical to v2
 args["frontend_dim"] = 1024
 args["latent_dim"] = 1024
 args["autoencoder_hidden_dim"] = 512
-args["transformer_num_layers"] = 10  # Deeper (was 8)
+args["transformer_num_layers"] = 8  # Same as v2 (10 was worse)
 args["transformer_n_heads"] = 8
-args["transformer_dim_ff"] = 4096  # 4x expansion
-args["transformer_dropout"] = 0.25  # Same as v2 (0.2 was too low, overfitting)
+args["transformer_dim_ff"] = 4096  # 4x expansion, same as v2
+args["transformer_dropout"] = 0.25  # Same as v2
 args["conformer_conv_kernel"] = 31
-args["drop_path_prob"] = 0.2  # Higher for deeper model
+args["drop_path_prob"] = 0.15  # Same as v2
 
-# Training optimization
+# Training optimization — identical to v2
 args["optimizer"] = "adamw"
-args["lrStart"] = 0.0005  # Same as v2 (0.0006 was too aggressive)
-args["lrEnd"] = 0.00005  # Same as v2
+args["lrStart"] = 0.0005
+args["lrEnd"] = 0.00005
 args["weight_decay"] = 1e-3
-args["warmup_steps"] = 2000  # Same as v2
+args["warmup_steps"] = 2000
 args["label_smoothing"] = 0.1
 
 # SpecAugment — slightly stronger than v2
 args["use_spec_augment"] = True
-args["spec_augment_freq_mask"] = 110  # Slightly wider than v2's 100
-args["spec_augment_time_mask"] = 45  # Slightly wider than v2's 40
+args["spec_augment_freq_mask"] = 110  # v2 was 100
+args["spec_augment_time_mask"] = 45  # v2 was 40
 
 # Intermediate CTC
 args["interctc_weight"] = 0.3
@@ -75,13 +75,13 @@ args["interctc_weight"] = 0.3
 # v2 architecture features
 args["autoencoder_residual"] = True
 
-# v3 architecture features
-args["use_rope"] = True  # Rotary Position Embeddings
+# No RoPE (hurt performance on this dataset)
+args["use_rope"] = False
 
-# Training features
+# Training features — same as v2
 args["use_amp"] = True
 args["use_ema"] = True
-args["ema_decay"] = 0.999  # Same as v2
+args["ema_decay"] = 0.999
 
 from neural_decoder.neural_decoder_trainer import trainModel
 
