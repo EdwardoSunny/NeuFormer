@@ -537,14 +537,16 @@ class GPT2CTCDecoderLM:
 
             def start(self, start_with_nothing: bool) -> _LMState:
                 state = _LMState()
+                # encode returns [1, seq_len]; keep 2D for model input
                 tokenized = parent.tokenizer.encode(
                     parent.tokenizer.bos_token, return_tensors="pt"
-                )[0].to(parent.device)
+                ).to(parent.device)  # [1, seq_len]
                 with torch.no_grad():
                     output = parent.model(tokenized, past_key_values=None)
+                # logits is [1, seq_len, vocab]; squeeze batch dim
                 self.infos[state] = {
                     "score": 0.0,
-                    "last_token_logit": output.logits[-1].cpu(),
+                    "last_token_logit": output.logits[0, -1].cpu(),
                     "past_key_values": self._past_kv_to_device(
                         output.past_key_values, "cpu"
                     ),
@@ -561,25 +563,29 @@ class GPT2CTCDecoderLM:
                     return new_state, self.infos[new_state]["score"]
 
                 info = self.infos[state]
-                input_ids = parent.tokenizer.encode(" " + word, return_tensors="pt")[
-                    0
-                ].to(parent.device)
+                # encode returns [1, seq_len]; keep 2D for model
+                input_ids_2d = parent.tokenizer.encode(
+                    " " + word, return_tensors="pt"
+                ).to(parent.device)  # [1, seq_len]
+                input_ids_1d = input_ids_2d[0]  # [seq_len] for loss computation
                 last_logit = info["last_token_logit"].to(parent.device)
                 pkv = self._past_kv_to_device(info["past_key_values"], parent.device)
 
                 with torch.no_grad():
-                    output = parent.model(input_ids, past_key_values=pkv)
+                    output = parent.model(input_ids_2d, past_key_values=pkv)
+
+                # output.logits is [1, seq_len, vocab]; squeeze batch dim
+                logits_sq = output.logits[0]  # [seq_len, vocab]
 
                 # Score = 1 / (cross-entropy + eps)
-                lm_logits = torch.cat(
-                    [last_logit.unsqueeze(0), output.logits[:-1]], dim=0
-                )
+                # last_logit predicts first token; logits[:-1] predict rest
+                lm_logits = torch.cat([last_logit.unsqueeze(0), logits_sq[:-1]], dim=0)
                 loss_fn = torch.nn.CrossEntropyLoss(reduction="mean")
-                score = 1.0 / (loss_fn(lm_logits, input_ids) + 0.001)
+                score = 1.0 / (loss_fn(lm_logits, input_ids_1d) + 0.001)
 
                 self.infos[new_state] = {
                     "score": score.cpu().item(),
-                    "last_token_logit": output.logits[-1].cpu(),
+                    "last_token_logit": logits_sq[-1].cpu(),
                     "past_key_values": self._past_kv_to_device(
                         output.past_key_values, "cpu"
                     ),
