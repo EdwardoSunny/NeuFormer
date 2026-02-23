@@ -87,6 +87,10 @@ def load_conformer(model_dir: str, n_days: int = 24, device: str = "cuda"):
         drop_path_prob=0.0,
         autoencoder_residual=args.get("autoencoder_residual", False),
         use_rope=args.get("use_rope", False),
+        use_depthwise_frontend=args.get("use_depthwise_frontend", False),
+        depthwise_hidden_dim=args.get("depthwise_hidden_dim", 1024),
+        decoder_layers=args.get("decoder_layers", 0),
+        decoder_ff_dim=args.get("decoder_ff_dim", 0),
         device=device,
     ).to(device)
     state = torch.load(
@@ -94,7 +98,7 @@ def load_conformer(model_dir: str, n_days: int = 24, device: str = "cuda"):
         map_location=device,
         weights_only=True,
     )
-    model.load_state_dict(state)
+    model.load_state_dict(state, strict=False)
     model.eval()
     return model, args
 

@@ -50,9 +50,40 @@ class DaySpecificLinear(nn.Module):
         return torch.einsum("btd,bdk->btk", x, day_w) + day_b
 
 
+class Highway(nn.Module):
+    """Highway layer with gated residual (from B2T_Model).
+
+    ``y = g * x + (1 - g) * relu(A(x))`` where ``g = sigmoid(B(x))``.
+    The gate bias is initialized positive so the layer starts as near-identity.
+    """
+
+    def __init__(self, dim: int, num_layers: int = 2):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [nn.Linear(dim, dim * 2) for _ in range(num_layers)]
+        )
+        for layer in self.layers:
+            # Bias gate toward carrying input forward
+            layer.bias[dim:].data.fill_(1.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            proj = layer(x)
+            nonlinear, gate = proj.chunk(2, dim=-1)
+            nonlinear = F.relu(nonlinear)
+            gate = torch.sigmoid(gate)
+            x = gate * x + (1 - gate) * nonlinear
+        return x
+
+
 class NeuralFrontend(nn.Module):
     """
     Frontend processing: Gaussian smoothing → Strided temporal conv → Project
+
+    When ``use_depthwise_frontend=True`` (v4), uses B2T-style frontend:
+        Depthwise Conv (stride 2) → Highway → Standard Conv (stride 2) → Highway
+    This processes each electrode independently first, then mixes channels.
+    Total temporal stride = 4 (same as before).
     """
 
     def __init__(
@@ -63,11 +94,14 @@ class NeuralFrontend(nn.Module):
         temporal_kernel: int = 32,
         temporal_stride: int = 4,
         gaussian_smooth_width: float = 2.0,
+        use_depthwise_frontend: bool = False,
+        depthwise_hidden_dim: int = 1024,
     ):
         super().__init__()
         self.n_channels = n_channels
         self.temporal_kernel = temporal_kernel
         self.temporal_stride = temporal_stride
+        self.use_depthwise_frontend = use_depthwise_frontend
 
         # Gaussian smoothing (like GRU preprocessing)
         if gaussian_smooth_width > 0:
@@ -80,23 +114,54 @@ class NeuralFrontend(nn.Module):
         else:
             self.gaussian_kernel = None
 
-        # Strided temporal convolution (like GRU's unfold operation)
-        if temporal_kernel > 0:
-            self.temporal_conv = nn.Conv1d(
+        if use_depthwise_frontend:
+            # B2T-style: Depthwise Conv(s=2) → Highway → Conv(s=2) → Highway
+            # Stage 1: Depthwise conv — each electrode gets its own temporal filter
+            self.dw_conv = nn.Conv1d(
                 n_channels,
-                n_channels,
-                kernel_size=temporal_kernel,
-                stride=temporal_stride,
-                padding=0,  # No padding to match GRU's unfold behavior
-                groups=n_channels,
+                depthwise_hidden_dim,
+                kernel_size=7,
+                stride=2,
+                padding=3,
+                groups=n_channels,  # depthwise: each channel independent
                 bias=False,
             )
-            nn.init.constant_(self.temporal_conv.weight, 1.0 / temporal_kernel)
-        else:
-            self.temporal_conv = None
+            self.dw_act = nn.GELU()
+            self.highway1 = Highway(depthwise_hidden_dim, num_layers=2)
 
-        # Project to frontend dimension
-        self.proj = nn.Linear(n_channels, frontend_dim)
+            # Stage 2: Standard conv — mix all channels
+            self.mix_conv = nn.Conv1d(
+                depthwise_hidden_dim,
+                frontend_dim,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                groups=1,
+                bias=False,
+            )
+            self.mix_act = nn.GELU()
+            self.highway2 = Highway(frontend_dim, num_layers=2)
+
+            self.temporal_conv = None  # Not used in depthwise mode
+            self.proj = None
+        else:
+            # Original frontend: single strided conv → linear projection
+            if temporal_kernel > 0:
+                self.temporal_conv = nn.Conv1d(
+                    n_channels,
+                    n_channels,
+                    kernel_size=temporal_kernel,
+                    stride=temporal_stride,
+                    padding=0,
+                    groups=n_channels,
+                    bias=False,
+                )
+                nn.init.constant_(self.temporal_conv.weight, 1.0 / temporal_kernel)
+            else:
+                self.temporal_conv = None
+
+            self.proj = nn.Linear(n_channels, frontend_dim)
+
         self.ln = nn.LayerNorm(frontend_dim)
         self.dropout = nn.Dropout(dropout)
 
@@ -120,18 +185,29 @@ class NeuralFrontend(nn.Module):
             )
             x = x_smooth.transpose(1, 2)
 
-        # Apply strided temporal convolution
-        if self.temporal_conv is not None:
+        if self.use_depthwise_frontend:
+            # B2T-style frontend
             x_t = x.transpose(1, 2)  # [B, C, T]
-            x_strided = self.temporal_conv(x_t).transpose(1, 2)  # [B, T', C]
+            # Stage 1: depthwise conv (each electrode independent)
+            x_t = self.dw_act(self.dw_conv(x_t))  # [B, hidden, T/2]
+            x_out = self.highway1(x_t.transpose(1, 2))  # [B, T/2, hidden]
+            # Stage 2: standard conv (mix channels)
+            x_t = self.mix_act(
+                self.mix_conv(x_out.transpose(1, 2))
+            )  # [B, frontend_dim, T/4]
+            x_out = self.highway2(x_t.transpose(1, 2))  # [B, T/4, frontend_dim]
         else:
-            x_strided = x
+            # Original frontend
+            if self.temporal_conv is not None:
+                x_t = x.transpose(1, 2)  # [B, C, T]
+                x_out = self.temporal_conv(x_t).transpose(1, 2)  # [B, T', C]
+            else:
+                x_out = x
+            x_out = self.proj(x_out)
 
-        # Project to frontend dimension
-        x_proj = self.proj(x_strided)
-        x_proj = self.ln(x_proj)
-        x_proj = self.dropout(x_proj)
-        return x_proj
+        x_out = self.ln(x_out)
+        x_out = self.dropout(x_out)
+        return x_out
 
 
 class AutoEncoderEncoder(nn.Module):
@@ -481,10 +557,13 @@ class NeuralTransformerCTCModel(nn.Module):
     Conformer-based neural decoder for speech BCI.
     Architecture: Day Linear → Frontend → Autoencoder → Positional Encoding → Conformer → Output
 
-    v4 adds:
+    v4 adds (B2T-inspired):
+      - Depthwise-first frontend (``use_depthwise_frontend=True``): processes
+        each electrode independently before mixing channels.
+      - Deep decoder head (``decoder_layers > 0``): additional Conformer layers
+        between encoder and CTC projection for richer output modeling.
       - Optional character-level CTC head (``n_chars > 0``) for dual-task
-        training.  The character head shares the full encoder and adds a
-        separate classification head.
+        training.
     """
 
     def __init__(
@@ -510,6 +589,10 @@ class NeuralTransformerCTCModel(nn.Module):
         autoencoder_residual: bool = False,
         use_rope: bool = False,
         n_chars: int = 0,
+        use_depthwise_frontend: bool = False,
+        depthwise_hidden_dim: int = 1024,
+        decoder_layers: int = 0,
+        decoder_ff_dim: int = 0,
         device: str = "cuda",
     ):
         super().__init__()
@@ -528,6 +611,8 @@ class NeuralTransformerCTCModel(nn.Module):
             temporal_stride=temporal_stride,
             gaussian_smooth_width=gaussian_smooth_width,
             dropout=transformer_dropout,
+            use_depthwise_frontend=use_depthwise_frontend,
+            depthwise_hidden_dim=depthwise_hidden_dim,
         )
 
         # Autoencoder bottleneck
@@ -555,14 +640,11 @@ class NeuralTransformerCTCModel(nn.Module):
         # RoPE applies rotation inside attention instead)
         self.use_rope = use_rope
         if use_rope:
-            # RoPE doesn't need additive PE, but we keep the module for
-            # compatibility — its forward() is identity
             self.pos_enc = nn.Identity()
         else:
             self.pos_enc = PositionalEncoding(d_model=latent_dim)
 
-        # Conformer blocks with linearly increasing DropPath schedule
-        # (layer 0 gets 0 drop, final layer gets drop_path_prob)
+        # Conformer encoder blocks with linearly increasing DropPath schedule
         dp_rates = [
             drop_path_prob * i / max(transformer_layers - 1, 1)
             for i in range(transformer_layers)
@@ -583,14 +665,32 @@ class NeuralTransformerCTCModel(nn.Module):
         )
 
         # Intermediate CTC (for deep supervision)
-        self.use_interctc = transformer_layers >= 6  # Only use if we have enough layers
+        self.use_interctc = transformer_layers >= 6
         if self.use_interctc:
-            # Apply intermediate loss at middle layer (e.g., layer 4 out of 8)
             self.interctc_layer = transformer_layers // 2
             self.inter_output = nn.Linear(latent_dim, n_classes)
 
-        # Deep Classification Head (Linderman-style)
-        # Decouples feature learning from classification for better performance
+        # Deep decoder: additional Conformer layers before CTC head (B2T-style)
+        self.decoder_layers_count = decoder_layers
+        if decoder_layers > 0:
+            dec_ff_dim = decoder_ff_dim if decoder_ff_dim > 0 else transformer_ff_dim
+            self.decoder_conformer = nn.ModuleList(
+                [
+                    ConformerBlock(
+                        d_model=latent_dim,
+                        nhead=transformer_heads,
+                        dim_feedforward=dec_ff_dim,
+                        dropout=transformer_dropout,
+                        conv_kernel_size=conformer_conv_kernel,
+                        drop_path_prob=drop_path_prob
+                        * 0.5,  # lighter DropPath for decoder
+                        use_rope=use_rope,
+                    )
+                    for _ in range(decoder_layers)
+                ]
+            )
+
+        # CTC phoneme output head
         self.output = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim),
@@ -599,7 +699,7 @@ class NeuralTransformerCTCModel(nn.Module):
             nn.Linear(latent_dim, n_classes),
         )
 
-        # Character-level CTC head (dual-task, v4)
+        # Character-level CTC head (dual-task)
         self.n_chars = n_chars
         if n_chars > 0:
             self.char_output = nn.Sequential(
@@ -613,15 +713,24 @@ class NeuralTransformerCTCModel(nn.Module):
         # Store temporal parameters for length computation
         self.temporal_kernel = temporal_kernel
         self.temporal_stride = temporal_stride
+        self.use_depthwise_frontend = use_depthwise_frontend
 
     def compute_output_lengths(
         self, input_lengths: torch.Tensor, actual_seq_len: int
     ) -> torch.Tensor:
         """
         Compute output sequence lengths after temporal striding.
-        Matches GRU formula: (length - kernel) / stride
         """
-        if self.temporal_kernel > 0 and self.temporal_stride > 1:
+        if self.use_depthwise_frontend:
+            # B2T-style: two stride-2 convolutions with padding
+            # Stage 1: Conv(k=7, s=2, p=3) → (L + 2*3 - 7) // 2 + 1
+            L = input_lengths.float()
+            L = ((L + 2 * 3 - 7) / 2 + 1).floor()
+            # Stage 2: Conv(k=3, s=2, p=1) → (L + 2*1 - 3) // 2 + 1
+            L = ((L + 2 * 1 - 3) / 2 + 1).floor()
+            output_lengths = L.to(torch.int32)
+        elif self.temporal_kernel > 0 and self.temporal_stride > 1:
+            # Original: (length - kernel) / stride
             output_lengths = (
                 (input_lengths - self.temporal_kernel) / self.temporal_stride
             ).to(torch.int32)
@@ -681,7 +790,7 @@ class NeuralTransformerCTCModel(nn.Module):
                 (x.size(0),), actual_seq_len, dtype=torch.int32, device=x.device
             )
 
-        # Apply Conformer blocks with intermediate CTC
+        # Apply Conformer encoder blocks with intermediate CTC
         inter_log_probs = None
         for i, layer in enumerate(self.conformer_layers):
             z = layer(z, src_key_padding_mask=padding_mask)
@@ -692,6 +801,11 @@ class NeuralTransformerCTCModel(nn.Module):
                 inter_log_probs = inter_logits.log_softmax(dim=-1).transpose(
                     0, 1
                 )  # [T, B, C]
+
+        # Deep decoder: additional Conformer layers before CTC heads
+        if self.decoder_layers_count > 0:
+            for dec_layer in self.decoder_conformer:
+                z = dec_layer(z, src_key_padding_mask=padding_mask)
 
         # Output projection and log softmax (phoneme head)
         logits = self.output(z)  # [B, T, C]

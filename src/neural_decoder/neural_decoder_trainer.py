@@ -138,6 +138,10 @@ def trainModel(args):
             autoencoder_residual=args.get("autoencoder_residual", False),
             use_rope=args.get("use_rope", False),
             n_chars=N_CHARS if use_char_ctc else 0,
+            use_depthwise_frontend=args.get("use_depthwise_frontend", False),
+            depthwise_hidden_dim=args.get("depthwise_hidden_dim", 1024),
+            decoder_layers=args.get("decoder_layers", 0),
+            decoder_ff_dim=args.get("decoder_ff_dim", 0),
             device=device,
         ).to(device)
     else:
@@ -599,6 +603,10 @@ def loadConformerModel(modelDir, nInputLayers=24, device="cuda"):
         autoencoder_residual=args.get("autoencoder_residual", False),
         use_rope=args.get("use_rope", False),
         n_chars=0,  # Char head not needed at inference
+        use_depthwise_frontend=args.get("use_depthwise_frontend", False),
+        depthwise_hidden_dim=args.get("depthwise_hidden_dim", 1024),
+        decoder_layers=args.get("decoder_layers", 0),
+        decoder_ff_dim=args.get("decoder_ff_dim", 0),
         device=device,
     ).to(device)
 
