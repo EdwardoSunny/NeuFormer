@@ -596,11 +596,12 @@ class GPT2CTCDecoderLM:
                 # output.logits is [1, seq_len, vocab]; squeeze batch dim
                 logits_sq = output.logits[0]  # [seq_len, vocab]
 
-                # Score = 1 / (cross-entropy + eps)
-                # last_logit predicts first token; logits[:-1] predict rest
+                # Score = negative total cross-entropy (sum, not mean, to avoid
+                # length-normalization bias that favours multi-subword words).
+                # Behaves like log-prob: 0 = perfect, large negative = unlikely.
                 lm_logits = torch.cat([last_logit.unsqueeze(0), logits_sq[:-1]], dim=0)
-                loss_fn = torch.nn.CrossEntropyLoss(reduction="mean")
-                score = 1.0 / (loss_fn(lm_logits, input_ids_1d) + 0.001)
+                loss_fn = torch.nn.CrossEntropyLoss(reduction="sum")
+                score = -loss_fn(lm_logits, input_ids_1d)
 
                 self.infos[new_state] = {
                     "score": score.cpu().item(),
