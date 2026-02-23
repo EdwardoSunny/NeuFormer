@@ -139,6 +139,12 @@ def main():
     ap.add_argument("--word_score", type=float, default=0.0)
     ap.add_argument("--beam_size", type=int, default=50)
     ap.add_argument("--beam_threshold", type=float, default=50.0)
+    ap.add_argument(
+        "--max_utts",
+        type=int,
+        default=0,
+        help="Max utterances to decode (0=all, useful for quick sweeps)",
+    )
     ap.add_argument("--output", default=None)
     args = ap.parse_args()
 
@@ -181,6 +187,9 @@ def main():
     )
 
     # Decode
+    if args.max_utts > 0:
+        utterances = utterances[: args.max_utts]
+        print(f"  (limited to {args.max_utts} utterances for quick sweep)")
     preds, refs = [], []
     t0 = time.time()
     pbar = tqdm(utterances, desc="Decoding", unit="utt")
