@@ -1,341 +1,452 @@
 """
-N-gram WFST Decoder
-====================
-Wrapper around the C++ ``lm_decoder`` pybind11 module from the NEJM
-brain-to-text repo.  This provides Kaldi-based WFST CTC beam search
-with n-gram language model integration.
+CTC Beam Search Decoder with KenLM n-gram Language Model
+==========================================================
+Uses ``torchaudio.models.decoder.ctc_decoder`` for phoneme-level CTC beam
+search decoding with lexicon constraint and KenLM language model support.
 
-The C++ module performs CTC-WFST beam search using a pre-compiled
-TLG.fst (Token + Lexicon + Grammar) and optionally rescores the
-resulting lattice with an unpruned G.fst.
+Based on the torchaudio ASR inference tutorial:
+https://pytorch.org/audio/stable/tutorials/asr_inference_with_ctc_decoder_tutorial.html
+
+The Conformer outputs CTC log-probs over 41 classes::
+
+    [BLANK(0), AA(1), AE(2), ..., ZH(39), SIL(40)]
+
+Components
+----------
+- **Tokens**: the 41 CTC output symbols (``-`` for blank, 39 ARPABET phones,
+  ``|`` for silence/word-boundary).
+- **Lexicon**: mapping from words to phoneme sequences, constraining beam
+  search to only produce valid words.
+- **Language Model**: KenLM n-gram (``.arpa`` or ``.bin``), or a custom LM
+  that inherits ``CTCDecoderLM``.
+
+Required files in ``lm_dir``::
+
+    lexicon.txt      word → phoneme mapping  (auto-generated from
+                     lexicon_numbers.txt if missing)
+    tokens.txt       one token per line      (auto-generated if missing)
+    lm.arpa or lm.bin   KenLM language model (optional — omit for no LM)
 
 Usage
 -----
-    from neural_decoder.ngram_decoder import NgramWFSTDecoder
-    decoder = NgramWFSTDecoder(lm_path="/path/to/lm_dir")
-    results = decoder.decode(logits, blank_penalty=9.0)
-    # results is a list of dicts: {sentence, ac_score, lm_score}
+::
+
+    decoder = CTCBeamSearchDecoder("path/to/lm_dir")
+    text    = decoder.decode(log_probs)           # best hypothesis
+    nbest   = decoder.decode_nbest(log_probs, 5)  # top-5
+
+Custom LM
+----------
+You can also pass a custom ``torch.nn.Module`` language model via the
+``CTCDecoderLM`` / ``CTCDecoderLMState`` API::
+
+    from neural_decoder.ngram_decoder import CTCBeamSearchDecoder
+    from torchaudio.models.decoder import CTCDecoderLM, CTCDecoderLMState
+
+    class MyLM(CTCDecoderLM):
+        ...
+
+    decoder = CTCBeamSearchDecoder("path/to/lm_dir", lm=MyLM(my_model))
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Union
 
 import numpy as np
+import torch
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Phoneme table (must match Conformer CTC output indices)
+# ---------------------------------------------------------------------------
+PHONE_DEF = [
+    "AA",
+    "AE",
+    "AH",
+    "AO",
+    "AW",
+    "AY",
+    "B",
+    "CH",
+    "D",
+    "DH",
+    "EH",
+    "ER",
+    "EY",
+    "F",
+    "G",
+    "HH",
+    "IH",
+    "IY",
+    "JH",
+    "K",
+    "L",
+    "M",
+    "N",
+    "NG",
+    "OW",
+    "OY",
+    "P",
+    "R",
+    "S",
+    "SH",
+    "T",
+    "TH",
+    "UH",
+    "UW",
+    "V",
+    "W",
+    "Y",
+    "Z",
+    "ZH",
+]
+BLANK_TOKEN = "-"
+SIL_TOKEN = "|"
+TOKENS: List[str] = [BLANK_TOKEN] + PHONE_DEF + [SIL_TOKEN]  # len == 41
+
 
 @dataclass
-class NgramDecodeResult:
-    """Single hypothesis from WFST n-gram decoding."""
+class Hypothesis:
+    """A single decoded hypothesis."""
 
-    sentence: str
-    ac_score: float
-    lm_score: float
+    words: List[str]
+    score: float
+    tokens: List[int]
+    timesteps: Optional[torch.Tensor] = None
 
 
-class NgramWFSTDecoder:
-    """
-    Wrapper around the ``lm_decoder`` C++ pybind11 module.
+# ---------------------------------------------------------------------------
+# Greedy CTC decoder (no LM)
+# ---------------------------------------------------------------------------
+class GreedyCTCDecoder(torch.nn.Module):
+    """Greedy (argmax) CTC decoder — no language model, no beam search.
 
-    The module must be built from the NEJM brain-to-text repo's
-    ``language_model/runtime/server/x86/`` directory.  See build
-    instructions at the bottom of this file.
+    Given a sequence of CTC emissions, takes the argmax at each timestep,
+    collapses consecutive duplicates, and removes blanks.
 
     Parameters
     ----------
-    lm_path : str
-        Path to directory containing ``TLG.fst`` and ``words.txt``.
-        Optionally also ``G.fst`` and ``G_no_prune.fst`` for rescoring.
-    max_active : int
-        Maximum active states in WFST beam search.
-    min_active : int
-        Minimum active states.
-    beam : float
-        Beam width for decoding.
-    lattice_beam : float
-        Beam width for lattice generation.
-    acoustic_scale : float
-        Scale applied to acoustic (CTC) scores.
-    ctc_blank_skip_threshold : float
-        Skip frames where blank prob exceeds this threshold.
-    length_penalty : float
-        Penalty per token to control output length.
+    tokens : list of str
+        The 41 CTC output tokens in model order.
+    blank : int
+        Index of the CTC blank token (default 0).
+    """
+
+    def __init__(self, tokens: List[str] = TOKENS, blank: int = 0):
+        super().__init__()
+        self.tokens = tokens
+        self.blank = blank
+
+    def forward(self, emission: torch.Tensor) -> list:
+        """Decode a single utterance.
+
+        Parameters
+        ----------
+        emission : Tensor
+            Shape ``[T, n_classes]`` — log-probs or logits.
+
+        Returns
+        -------
+        list of str
+            Decoded words (phonemes joined, ``|`` treated as word boundary).
+        """
+        indices = torch.argmax(emission, dim=-1)
+        indices = torch.unique_consecutive(indices, dim=-1)
+        indices = [i for i in indices if i != self.blank]
+        joined = "".join([self.tokens[i] for i in indices])
+        return joined.replace("|", " ").strip().split()
+
+
+# ---------------------------------------------------------------------------
+# Beam search CTC decoder with KenLM
+# ---------------------------------------------------------------------------
+class CTCBeamSearchDecoder:
+    """CTC beam search decoder with optional KenLM n-gram language model.
+
+    Wraps ``torchaudio.models.decoder.ctc_decoder`` following the official
+    torchaudio tutorial pattern.
+
+    Parameters
+    ----------
+    lm_dir : str
+        Directory containing ``lexicon.txt``, ``tokens.txt``, and optionally
+        ``lm.arpa`` / ``lm.bin``.
+    lm_weight : float
+        Language model weight (higher → more LM influence).
+    word_score : float
+        Per-word insertion bonus (negative = penalty).
+    sil_score : float
+        Per-silence appearance bonus.
+    beam_size : int
+        Maximum number of active beam hypotheses.
+    beam_size_token : int or None
+        Number of top tokens to consider per step. ``None`` uses all tokens.
+    beam_threshold : float
+        Pruning threshold — hypotheses with scores more than this below the
+        best are discarded.
     nbest : int
-        Number of n-best hypotheses to return.
+        Maximum number of n-best hypotheses to return.
+    blank_penalty : float
+        Value *subtracted* from blank log-prob (log-space) to discourage
+        blank emissions.
+    lm : optional
+        A custom LM object (e.g. a ``CTCDecoderLM`` subclass wrapping a
+        neural LM). If provided, overrides the KenLM file in ``lm_dir``.
     """
 
     def __init__(
         self,
-        lm_path: str,
-        max_active: int = 7000,
-        min_active: int = 200,
-        beam: float = 17.0,
-        lattice_beam: float = 8.0,
-        acoustic_scale: float = 0.3,
-        ctc_blank_skip_threshold: float = 1.0,
-        length_penalty: float = 0.0,
-        nbest: int = 100,
+        lm_dir: str,
+        lm_weight: float = 3.23,
+        word_score: float = -0.26,
+        sil_score: float = 0.0,
+        beam_size: int = 1500,
+        beam_size_token: Optional[int] = None,
+        beam_threshold: float = 50.0,
+        nbest: int = 1,
+        blank_penalty: float = 0.0,
+        lm: Optional[object] = None,
     ):
-        self.lm_path = os.path.expanduser(lm_path)
-        self.nbest = nbest
-        self.acoustic_scale = acoustic_scale
+        self.lm_dir = os.path.expanduser(lm_dir)
+        self.blank_penalty = blank_penalty
 
-        if not os.path.exists(self.lm_path):
-            raise ValueError(f"Language model path does not exist: {self.lm_path}")
+        # ---- ensure required files exist --------------------------------
+        lex_path = os.path.join(self.lm_dir, "lexicon.txt")
+        tok_path = os.path.join(self.lm_dir, "tokens.txt")
 
-        try:
-            import lm_decoder
+        if not os.path.exists(lex_path):
+            num_lex = os.path.join(self.lm_dir, "lexicon_numbers.txt")
+            if os.path.exists(num_lex):
+                _convert_numeric_lexicon(num_lex, lex_path)
+            else:
+                raise FileNotFoundError(
+                    f"Need lexicon.txt or lexicon_numbers.txt in {self.lm_dir}"
+                )
+        if not os.path.exists(tok_path):
+            _write_tokens_file(tok_path)
 
-            self._lm_decoder = lm_decoder
-        except ImportError:
-            raise ImportError(
-                "The lm_decoder C++ module is not installed. "
-                "Build it from the language_model/runtime/server/x86/ directory. "
-                "See build instructions in this file's docstring."
-            )
+        # ---- resolve language model -------------------------------------
+        if lm is not None:
+            lm_source = lm  # custom CTCDecoderLM
+        else:
+            lm_source = _find_lm(self.lm_dir)  # path to .arpa/.bin or None
 
-        TLG_path = os.path.join(self.lm_path, "TLG.fst")
-        words_path = os.path.join(self.lm_path, "words.txt")
-        G_path = os.path.join(self.lm_path, "G.fst")
-        rescore_G_path = os.path.join(self.lm_path, "G_no_prune.fst")
+        # ---- build decoder via torchaudio factory -----------------------
+        from torchaudio.models.decoder import ctc_decoder
 
-        if not os.path.exists(rescore_G_path):
-            rescore_G_path = ""
-            G_path = ""
-        if not os.path.exists(G_path):
-            G_path = ""
-        if not os.path.exists(TLG_path):
-            raise ValueError(f"TLG.fst not found at {TLG_path}")
-        if not os.path.exists(words_path):
-            raise ValueError(f"words.txt not found at {words_path}")
+        decoder_kwargs = dict(
+            lexicon=lex_path,
+            tokens=tok_path,
+            lm=lm_source,
+            nbest=nbest,
+            beam_size=beam_size,
+            beam_threshold=beam_threshold,
+            lm_weight=lm_weight,
+            word_score=word_score,
+            sil_score=sil_score,
+            blank_token=BLANK_TOKEN,
+            sil_token=SIL_TOKEN,
+        )
+        if beam_size_token is not None:
+            decoder_kwargs["beam_size_token"] = beam_size_token
 
-        decode_opts = lm_decoder.DecodeOptions(
-            max_active,
-            min_active,
-            beam,
-            lattice_beam,
-            acoustic_scale,
-            ctc_blank_skip_threshold,
-            length_penalty,
-            nbest,
+        self._decoder = ctc_decoder(**decoder_kwargs)
+
+        logger.info(
+            "CTCBeamSearchDecoder ready  lm=%s  beam=%d  lm_weight=%.2f",
+            "custom" if lm is not None else ("yes" if lm_source else "none"),
+            beam_size,
+            lm_weight,
         )
 
-        decode_resource = lm_decoder.DecodeResource(
-            TLG_path,
-            G_path,
-            rescore_G_path,
-            words_path,
-            "",  # unit_path (not used for speech)
-        )
-
-        self._decoder = lm_decoder.BrainSpeechDecoder(decode_resource, decode_opts)
-        self._has_rescore = rescore_G_path != ""
-
-        logger.info(f"WFST decoder initialized from {self.lm_path}")
-        logger.info(f"  Rescoring available: {self._has_rescore}")
-
-    def update_params(
+    # ------------------------------------------------------------------
+    # Batch decoding
+    # ------------------------------------------------------------------
+    def __call__(
         self,
-        max_active: int = 7000,
-        min_active: int = 200,
-        beam: float = 17.0,
-        lattice_beam: float = 8.0,
-        acoustic_scale: float = 0.3,
-        ctc_blank_skip_threshold: float = 1.0,
-        length_penalty: float = 0.0,
-        nbest: int = 100,
-    ):
-        """Update decoder parameters without re-loading FSTs."""
-        self.acoustic_scale = acoustic_scale
-        self.nbest = nbest
+        emission: torch.Tensor,
+    ) -> list:
+        """Decode a batch of emissions (mirrors torchaudio API).
 
-        decode_opts = self._lm_decoder.DecodeOptions(
-            max_active,
-            min_active,
-            beam,
-            lattice_beam,
-            acoustic_scale,
-            ctc_blank_skip_threshold,
-            length_penalty,
-            nbest,
-        )
-        self._decoder.SetOpt(decode_opts)
+        Parameters
+        ----------
+        emission : Tensor
+            Shape ``[B, T, C]`` — log-probs or logits.
 
-    def reset(self):
-        """Reset decoder state (call between utterances)."""
-        self._decoder.Reset()
+        Returns
+        -------
+        list of list of CTCHypothesis
+            Outer list is per-batch, inner list is per-nbest.
+        """
+        return self._decoder(emission)
 
+    # ------------------------------------------------------------------
+    # Convenience: single-utterance decode
+    # ------------------------------------------------------------------
     def decode(
         self,
-        logits: np.ndarray,
-        blank_penalty: float = 9.0,
-        rescore: bool = True,
-        is_log_probs: bool = False,
-    ) -> List[NgramDecodeResult]:
-        """
-        Decode a single utterance.
+        emission: np.ndarray,
+        is_log_probs: bool = True,
+    ) -> List[str]:
+        """Return the best hypothesis words for one utterance.
 
         Parameters
         ----------
-        logits : np.ndarray, shape [T, 41]
-            Logits or log-probs from the model.
-            Expected order: [BLANK, SIL, phonemes...] (Kaldi order).
-            Use ``rearrange_logits()`` to convert from model order.
-        blank_penalty : float
-            Penalty applied to blank emissions.
-            Higher values encourage more non-blank emissions.
-            Paper default: 9.0 for offline, 7.0 for online.
-        rescore : bool
-            Whether to rescore with unpruned G.fst if available.
+        emission : ndarray
+            Shape ``[T, C]`` (C=41 for this model).
         is_log_probs : bool
-            If True, input is already log-probabilities (e.g. from
-            a model that applies log_softmax). Uses ``DecodeNumpyLogProbs``
-            which skips the internal log_softmax. Blank penalty is applied
-            manually before decoding.
-            If False (default), input is raw logits and ``DecodeNumpy``
-            applies log_softmax internally.
+            True if already log-softmax'd (Conformer default).
 
         Returns
         -------
-        List[NgramDecodeResult]
-            N-best hypotheses sorted by score.
+        list of str
+            Words from the best hypothesis.
         """
-        self._decoder.Reset()
+        results = self.decode_nbest(emission, n=1, is_log_probs=is_log_probs)
+        return results[0].words if results else []
 
-        logits = np.ascontiguousarray(logits, dtype=np.float32)
+    def decode_nbest(
+        self,
+        emission: np.ndarray,
+        n: int = 5,
+        is_log_probs: bool = True,
+    ) -> List[Hypothesis]:
+        """Return top-*n* hypotheses for one utterance.
 
-        if is_log_probs:
-            # Input is already log-probabilities (e.g. from Conformer
-            # which applies log_softmax). Use DecodeNumpyLogProbs which
-            # passes log-probs directly to the decoder without applying
-            # log_softmax again.
-            # We apply blank_penalty manually here.
-            log_probs = logits.copy()
-            log_probs[:, 0] -= np.log(blank_penalty)
-            self._lm_decoder.DecodeNumpyLogProbs(self._decoder, log_probs)
-        else:
-            # Input is raw logits. DecodeNumpy applies log_softmax,
-            # subtracts log_priors, and applies blank_penalty internally.
-            log_priors = np.zeros_like(logits)
-            self._lm_decoder.DecodeNumpy(
-                self._decoder,
-                logits,
-                log_priors,
-                np.log(blank_penalty),
-            )
+        Parameters
+        ----------
+        emission : ndarray
+            Shape ``[T, C]``.
+        n : int
+            Number of hypotheses to return.
+        is_log_probs : bool
+            Whether the input is already log-softmax'd.
 
-        self._decoder.FinishDecoding()
+        Returns
+        -------
+        list of Hypothesis
+        """
+        em = torch.from_numpy(np.ascontiguousarray(emission, dtype=np.float32))
 
-        # Optionally rescore with unpruned LM
-        if rescore and self._has_rescore:
-            self._decoder.Rescore()
+        if not is_log_probs:
+            em = torch.nn.functional.log_softmax(em, dim=-1)
 
-        # Extract results
-        results = []
-        for r in self._decoder.result():
-            results.append(
-                NgramDecodeResult(
-                    sentence=r.sentence.strip(),
-                    ac_score=r.ac_score,
-                    lm_score=r.lm_score,
+        if self.blank_penalty > 0:
+            em[:, 0] -= self.blank_penalty
+
+        # ctc_decoder expects [B, T, C]
+        out = self._decoder(em.unsqueeze(0))
+        hypotheses = []
+        for hyp in out[0][:n]:
+            hypotheses.append(
+                Hypothesis(
+                    words=list(hyp.words) if hyp.words else [],
+                    score=hyp.score,
+                    tokens=hyp.tokens.tolist()
+                    if hasattr(hyp.tokens, "tolist")
+                    else list(hyp.tokens),
+                    timesteps=hyp.timesteps if hasattr(hyp, "timesteps") else None,
                 )
             )
+        return hypotheses
 
-        return results
-
-    def decode_streaming(
+    def decode_text(
         self,
-        logits: np.ndarray,
-        blank_penalty: float = 9.0,
-        is_log_probs: bool = False,
+        emission: np.ndarray,
+        is_log_probs: bool = True,
     ) -> str:
-        """
-        Feed logits incrementally (for streaming/online use).
-        Does NOT reset or finalize — call reset() before and
-        finish_and_get_results() after.
+        """Return the best hypothesis as a plain text string.
 
         Parameters
         ----------
-        logits : np.ndarray, shape [T, 41]
-            A chunk of logits or log-probs.
-        blank_penalty : float
-            Blank penalty.
+        emission : ndarray
+            Shape ``[T, C]``.
         is_log_probs : bool
-            If True, input is already log-probabilities.
-
-        Returns
-        -------
-        str
-            Current partial decoded sentence.
+            Whether the input is already log-softmax'd.
         """
-        logits = np.ascontiguousarray(logits, dtype=np.float32)
+        words = self.decode(emission, is_log_probs=is_log_probs)
+        return " ".join(words).strip() if words else ""
 
-        if is_log_probs:
-            log_probs = logits.copy()
-            log_probs[:, 0] -= np.log(blank_penalty)
-            self._lm_decoder.DecodeNumpyLogProbs(self._decoder, log_probs)
-        else:
-            log_priors = np.zeros_like(logits)
-            self._lm_decoder.DecodeNumpy(
-                self._decoder,
-                logits,
-                log_priors,
-                np.log(blank_penalty),
-            )
+    # ------------------------------------------------------------------
+    # Incremental (streaming) decoding
+    # ------------------------------------------------------------------
+    def decode_begin(self):
+        """Initialize internal state for incremental decoding."""
+        self._decoder.decode_begin()
 
-        if self._decoder.DecodedSomething():
-            return self._decoder.result()[0].sentence.strip()
-        return ""
+    def decode_step(self, emission_frame: torch.Tensor):
+        """Feed one frame (or a few frames) to the incremental decoder.
 
-    def finish_and_get_results(
-        self,
-        rescore: bool = True,
-    ) -> List[NgramDecodeResult]:
+        Parameters
+        ----------
+        emission_frame : Tensor
+            Shape ``[1, C]`` or ``[F, C]`` for F frames.
         """
-        Finalize streaming decoding and return results.
-        Call after all chunks have been fed via decode_streaming().
-        """
-        self._decoder.FinishDecoding()
+        self._decoder.decode_step(emission_frame)
 
-        if rescore and self._has_rescore:
-            self._decoder.Rescore()
+    def decode_end(self):
+        """Finalize incremental decoding."""
+        self._decoder.decode_end()
 
-        results = []
-        for r in self._decoder.result():
-            results.append(
-                NgramDecodeResult(
-                    sentence=r.sentence.strip(),
-                    ac_score=r.ac_score,
-                    lm_score=r.lm_score,
-                )
-            )
-        return results
+    def get_final_hypothesis(self) -> list:
+        """Retrieve hypotheses after incremental decoding."""
+        return self._decoder.get_final_hypothesis()
 
 
-def rearrange_logits(logits: np.ndarray) -> np.ndarray:
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _find_lm(lm_dir: str) -> Optional[str]:
+    """Search for a KenLM file in *lm_dir*."""
+    for name in ("lm.bin", "lm.arpa", "lm_orig.arpa", "lm_pruned.arpa"):
+        p = os.path.join(lm_dir, name)
+        if os.path.exists(p):
+            logger.info("Found LM: %s", p)
+            return p
+    logger.warning("No KenLM file found in %s — decoding without LM", lm_dir)
+    return None
+
+
+def _convert_numeric_lexicon(src: str, dst: str):
+    """Convert ``lexicon_numbers.txt`` → torchaudio ``lexicon.txt``.
+
+    ``lexicon_numbers.txt`` format::
+
+        WORD id1 id2 ...
+
+    where token IDs use model order: 1=AA … 39=ZH, 40=SIL.
+
+    torchaudio ``lexicon.txt`` format::
+
+        WORD PHONEME PHONEME ... |
     """
-    Rearrange logits from model order to Kaldi/WFST order.
+    id2ph = {i + 1: p for i, p in enumerate(PHONE_DEF)}
+    id2ph[len(PHONE_DEF) + 1] = SIL_TOKEN  # 40 → |
 
-    Model order:  [BLANK, phonemes(1-39), SIL(40)]
-    Kaldi order:  [BLANK, SIL, phonemes(1-39)]
+    with open(src) as fin, open(dst, "w") as fout:
+        for line in fin:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            word = parts[0]
+            phones = [id2ph.get(int(t), "") for t in parts[1:]]
+            phones = [p for p in phones if p]  # drop unknowns
+            if not phones or phones[-1] != SIL_TOKEN:
+                phones.append(SIL_TOKEN)
+            fout.write(f"{word} {' '.join(phones)}\n")
+    logger.info("Wrote %s", dst)
 
-    Parameters
-    ----------
-    logits : np.ndarray, shape [..., 41]
-        Logits in model order (last dim is classes).
 
-    Returns
-    -------
-    np.ndarray
-        Logits rearranged to Kaldi order.
-    """
-    # Move SIL (index 40) to position 1, shift phonemes right
-    return np.concatenate(
-        [logits[..., 0:1], logits[..., -1:], logits[..., 1:-1]],
-        axis=-1,
-    )
+def _write_tokens_file(path: str):
+    """Write the default 41-token file (blank + 39 phones + SIL)."""
+    with open(path, "w") as f:
+        for tok in TOKENS:
+            f.write(tok + "\n")
+    logger.info("Wrote %s", path)
