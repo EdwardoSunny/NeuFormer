@@ -480,6 +480,11 @@ class NeuralTransformerCTCModel(nn.Module):
     """
     Conformer-based neural decoder for speech BCI.
     Architecture: Day Linear → Frontend → Autoencoder → Positional Encoding → Conformer → Output
+
+    v4 adds:
+      - Optional character-level CTC head (``n_chars > 0``) for dual-task
+        training.  The character head shares the full encoder and adds a
+        separate classification head.
     """
 
     def __init__(
@@ -504,6 +509,7 @@ class NeuralTransformerCTCModel(nn.Module):
         drop_path_prob: float = 0.1,
         autoencoder_residual: bool = False,
         use_rope: bool = False,
+        n_chars: int = 0,
         device: str = "cuda",
     ):
         super().__init__()
@@ -593,6 +599,17 @@ class NeuralTransformerCTCModel(nn.Module):
             nn.Linear(latent_dim, n_classes),
         )
 
+        # Character-level CTC head (dual-task, v4)
+        self.n_chars = n_chars
+        if n_chars > 0:
+            self.char_output = nn.Sequential(
+                nn.Linear(latent_dim, latent_dim),
+                nn.LayerNorm(latent_dim),
+                nn.GELU(),
+                nn.Dropout(transformer_dropout),
+                nn.Linear(latent_dim, n_chars),
+            )
+
         # Store temporal parameters for length computation
         self.temporal_kernel = temporal_kernel
         self.temporal_stride = temporal_stride
@@ -617,16 +634,19 @@ class NeuralTransformerCTCModel(nn.Module):
         x: torch.Tensor,
         day_ids: torch.Tensor,
         input_lengths: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]
+    ]:
         """
         x: [B, T, C] - Neural features
         day_ids: [B] - Day indices
         input_lengths: [B] - Actual sequence lengths before padding
 
         returns:
-            log_probs: [T', B, n_classes] - Log probabilities for CTC
+            log_probs: [T', B, n_classes] - Log probabilities for CTC (phoneme)
             out_lengths: [B] - Actual output sequence lengths
             inter_log_probs: [T', B, n_classes] or None - Intermediate log probs for InterCTC
+            char_log_probs: [T', B, n_chars] or None - Character log probs for dual-task CTC
         """
         # Day-specific normalization
         x = self.day_linear(x, day_ids)
@@ -673,8 +693,16 @@ class NeuralTransformerCTCModel(nn.Module):
                     0, 1
                 )  # [T, B, C]
 
-        # Output projection and log softmax
+        # Output projection and log softmax (phoneme head)
         logits = self.output(z)  # [B, T, C]
         log_probs = logits.log_softmax(dim=-1).transpose(0, 1)  # [T, B, C] for CTC
 
-        return log_probs, out_lengths, inter_log_probs
+        # Character-level CTC head (dual-task)
+        char_log_probs = None
+        if self.n_chars > 0 and self.training:
+            char_logits = self.char_output(z)  # [B, T, n_chars]
+            char_log_probs = char_logits.log_softmax(dim=-1).transpose(
+                0, 1
+            )  # [T, B, n_chars]
+
+        return log_probs, out_lengths, inter_log_probs, char_log_probs

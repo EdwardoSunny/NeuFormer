@@ -452,4 +452,141 @@ def _write_tokens_file(path: str):
     with open(path, "w") as f:
         for tok in TOKENS:
             f.write(tok + "\n")
-    logger.info("Wrote %s", path)
+
+
+# ---------------------------------------------------------------------------
+# GPT-2 Neural Language Model for CTC beam search
+# ---------------------------------------------------------------------------
+
+
+class GPT2CTCDecoderLM:
+    """GPT-2 language model adapter for ``torchaudio.models.decoder.ctc_decoder``.
+
+    Wraps a HuggingFace GPT-2 model as a ``CTCDecoderLM`` so it can be used
+    in lexicon-constrained CTC beam search.  At each word boundary the LM
+    scores the new word in context using the GPT-2 cross-entropy, providing
+    much stronger rescoring than KenLM n-grams.
+
+    Based on B2T_Model's ``CustomLM`` implementation.
+
+    Parameters
+    ----------
+    model_id : str
+        HuggingFace model ID (default ``"gpt2"``).
+    device : str
+        Device for the GPT-2 model (default ``"cuda"``).
+
+    Usage
+    -----
+    ::
+
+        from neural_decoder.ngram_decoder import GPT2CTCDecoderLM, CTCBeamSearchDecoder
+
+        gpt2_lm = GPT2CTCDecoderLM("gpt2", device="cuda")
+        decoder = CTCBeamSearchDecoder(
+            lm_dir="lm_dir",
+            lm=gpt2_lm.build_lm("lm_dir/lexicon.txt", "lm_dir/tokens.txt"),
+            lm_weight=2.0,
+            beam_size=50,
+        )
+    """
+
+    def __init__(self, model_id: str = "gpt2", device: str = "cuda"):
+        from transformers import AutoTokenizer, GPT2LMHeadModel
+
+        self.device = device
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        self.model = GPT2LMHeadModel.from_pretrained(model_id).eval().to(device)
+
+    def build_lm(self, lexicon_path: str, tokens_path: str):
+        """Build and return a ``CTCDecoderLM`` that wraps this GPT-2 model.
+
+        The returned object can be passed as the ``lm`` argument to
+        ``CTCBeamSearchDecoder``.
+
+        Parameters
+        ----------
+        lexicon_path : str
+            Path to ``lexicon.txt``.
+        tokens_path : str
+            Path to ``tokens.txt``.
+        """
+        from flashlight.lib.text.decoder import (
+            LM as _LM,
+            LMState as _LMState,
+        )
+        from flashlight.lib.text.dictionary import (
+            create_word_dict as _create_word_dict,
+            load_words as _load_words,
+        )
+
+        lexicon = _load_words(lexicon_path)
+        self._word_dict = _create_word_dict(lexicon)
+
+        parent = self
+
+        class _GPT2LM(_LM):
+            """Flashlight LM interface backed by GPT-2."""
+
+            def __init__(self):
+                _LM.__init__(self)
+                self.infos = {}
+
+            def _past_kv_to_device(self, pkv, device):
+                return tuple(tuple(t.to(device) for t in layer) for layer in pkv)
+
+            def start(self, start_with_nothing: bool) -> _LMState:
+                state = _LMState()
+                tokenized = parent.tokenizer.encode(
+                    parent.tokenizer.bos_token, return_tensors="pt"
+                )[0].to(parent.device)
+                with torch.no_grad():
+                    output = parent.model(tokenized, past_key_values=None)
+                self.infos[state] = {
+                    "score": 0.0,
+                    "last_token_logit": output.logits[-1].cpu(),
+                    "past_key_values": self._past_kv_to_device(
+                        output.past_key_values, "cpu"
+                    ),
+                }
+                return state
+
+            def score(self, state: _LMState, usr_token_idx: int):
+                word = parent._word_dict.get_entry(usr_token_idx)
+                return self._score_word(state, word, usr_token_idx)
+
+            def _score_word(self, state, word, usr_token_idx):
+                new_state = state.child(usr_token_idx)
+                if new_state in self.infos:
+                    return new_state, self.infos[new_state]["score"]
+
+                info = self.infos[state]
+                input_ids = parent.tokenizer.encode(" " + word, return_tensors="pt")[
+                    0
+                ].to(parent.device)
+                last_logit = info["last_token_logit"].to(parent.device)
+                pkv = self._past_kv_to_device(info["past_key_values"], parent.device)
+
+                with torch.no_grad():
+                    output = parent.model(input_ids, past_key_values=pkv)
+
+                # Score = 1 / (cross-entropy + eps)
+                lm_logits = torch.cat(
+                    [last_logit.unsqueeze(0), output.logits[:-1]], dim=0
+                )
+                loss_fn = torch.nn.CrossEntropyLoss(reduction="mean")
+                score = 1.0 / (loss_fn(lm_logits, input_ids) + 0.001)
+
+                self.infos[new_state] = {
+                    "score": score.cpu().item(),
+                    "last_token_logit": output.logits[-1].cpu(),
+                    "past_key_values": self._past_kv_to_device(
+                        output.past_key_values, "cpu"
+                    ),
+                }
+                return new_state, score.cpu().item()
+
+            def finish(self, state: _LMState):
+                return self._score_word(state, parent.tokenizer.eos_token, -1)
+
+        return _GPT2LM()

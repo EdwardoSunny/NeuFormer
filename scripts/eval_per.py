@@ -180,7 +180,8 @@ def main():
 
             with torch.no_grad():
                 if is_conformer:
-                    pred, adjustedLens, _ = model(X, day_t, X_len)
+                    out = model(X, day_t, X_len)
+                    pred, adjustedLens = out[0], out[1]
                     # pred is [T, B, C] (log-probs)
                 else:
                     logits = model.forward(X, day_t)

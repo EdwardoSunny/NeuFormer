@@ -101,9 +101,9 @@ def extract_logits(model, args, partition, data, device="cuda"):
             day_t = torch.tensor([day_idx], dtype=torch.int64, device=device)
             with torch.no_grad():
                 if is_conf:
-                    lp, ol, _ = model(X, day_t, X_len)
-                    lp = lp[:, 0, :].cpu().numpy()
-                    ol = ol[0].cpu().item()
+                    out = model(X, day_t, X_len)
+                    lp = out[0][:, 0, :].cpu().numpy()
+                    ol = out[1][0].cpu().item()
                 else:
                     logits = model.forward(X, day_t)
                     ol = int(((X_len - model.kernelLen) / model.strideLen)[0].item())

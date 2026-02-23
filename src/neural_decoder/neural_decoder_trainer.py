@@ -13,31 +13,42 @@ import wandb
 
 from .model import GRUDecoder
 from .transformer_ctc import NeuralTransformerCTCModel
-from .dataset import SpeechDataset
+from .dataset import SpeechDataset, N_CHARS
 
 
 def getDatasetLoaders(
     datasetName,
     batchSize,
+    load_chars=False,
 ):
     with open(datasetName, "rb") as handle:
         loadedData = pickle.load(handle)
 
     def _padding(batch):
-        X, y, X_lens, y_lens, days = zip(*batch)
-        X_padded = pad_sequence(X, batch_first=True, padding_value=0)
-        y_padded = pad_sequence(y, batch_first=True, padding_value=0)
+        if load_chars:
+            X, y, X_lens, y_lens, days, c, c_lens = zip(*batch)
+        else:
+            X, y, X_lens, y_lens, days = zip(*batch)
 
-        return (
+        X_padded = pad_sequence(list(X), batch_first=True, padding_value=0)
+        y_padded = pad_sequence(list(y), batch_first=True, padding_value=0)
+
+        result = (
             X_padded,
             y_padded,
-            torch.stack(X_lens),
-            torch.stack(y_lens),
-            torch.stack(days),
+            torch.stack(list(X_lens)),
+            torch.stack(list(y_lens)),
+            torch.stack(list(days)),
         )
 
-    train_ds = SpeechDataset(loadedData["train"], transform=None)
-    test_ds = SpeechDataset(loadedData["test"])
+        if load_chars:
+            c_padded = pad_sequence(list(c), batch_first=True, padding_value=0)
+            result = result + (c_padded, torch.stack(list(c_lens)))
+
+        return result
+
+    train_ds = SpeechDataset(loadedData["train"], transform=None, load_chars=load_chars)
+    test_ds = SpeechDataset(loadedData["test"], load_chars=False)
 
     train_loader = DataLoader(
         train_ds,
@@ -53,10 +64,24 @@ def getDatasetLoaders(
         shuffle=False,
         num_workers=0,
         pin_memory=True,
-        collate_fn=_padding,
+        collate_fn=lambda batch: _padding_simple(batch),
     )
 
     return train_loader, test_loader, loadedData
+
+
+def _padding_simple(batch):
+    """Collate for test loader (never loads chars)."""
+    X, y, X_lens, y_lens, days = zip(*batch)
+    X_padded = pad_sequence(list(X), batch_first=True, padding_value=0)
+    y_padded = pad_sequence(list(y), batch_first=True, padding_value=0)
+    return (
+        X_padded,
+        y_padded,
+        torch.stack(list(X_lens)),
+        torch.stack(list(y_lens)),
+        torch.stack(list(days)),
+    )
 
 
 def trainModel(args):
@@ -78,9 +103,14 @@ def trainModel(args):
         ),  # Can be "online", "offline", or "disabled"
     )
 
+    # Dual-task CTC config
+    use_char_ctc = args.get("use_char_ctc", False)
+    char_ctc_weight = args.get("char_ctc_weight", 0.3)
+
     trainLoader, testLoader, loadedData = getDatasetLoaders(
         args["datasetPath"],
         args["batchSize"],
+        load_chars=use_char_ctc,
     )
 
     # Create model based on type
@@ -106,6 +136,7 @@ def trainModel(args):
             drop_path_prob=args.get("drop_path_prob", 0.1),
             autoencoder_residual=args.get("autoencoder_residual", False),
             use_rope=args.get("use_rope", False),
+            n_chars=N_CHARS if use_char_ctc else 0,
             device=device,
         ).to(device)
     else:
@@ -151,12 +182,21 @@ def trainModel(args):
             blank=blank_idx, reduction="mean", zero_infinity=True
         )
 
+    # Character CTC loss (always uses reduction="none" for averaging)
+    if use_char_ctc:
+        loss_char_ctc = torch.nn.CTCLoss(blank=0, reduction="none", zero_infinity=True)
+
+    # v4 augmentation config
+    mult_noise_sd = args.get("mult_noise_sd", 0.0)
+    temporal_shift_max = args.get("temporal_shift_max", 0)
+
     # Optimizer and scheduler
     if args.get("optimizer", "adam") == "adamw":
+        beta2 = args.get("beta2", 0.999)
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=args["lrStart"],
-            betas=(0.9, 0.999),
+            betas=(0.9, beta2),
             eps=1e-6,  # Increased from 1e-8 for stability with mixed precision
             weight_decay=args.get("weight_decay", args.get("l2_decay", 0)),
         )
@@ -212,10 +252,17 @@ def trainModel(args):
         model.train()
 
         try:
-            X, y, X_len, y_len, dayIdx = next(train_iter)
+            batch_data = next(train_iter)
         except StopIteration:
             train_iter = iter(trainLoader)
-            X, y, X_len, y_len, dayIdx = next(train_iter)
+            batch_data = next(train_iter)
+
+        if use_char_ctc:
+            X, y, X_len, y_len, dayIdx, char_y, char_y_len = batch_data
+            char_y = char_y.to(device)
+            char_y_len = char_y_len.to(device)
+        else:
+            X, y, X_len, y_len, dayIdx = batch_data
 
         X, y, X_len, y_len, dayIdx = (
             X.to(device),
@@ -225,21 +272,39 @@ def trainModel(args):
             dayIdx.to(device),
         )
 
-        # Noise augmentation is faster on GPU
+        # -- Data augmentation --
+
+        # Multiplicative noise (v4): simulates electrode gain changes
+        if mult_noise_sd > 0:
+            X = X * (1.0 + torch.randn(X.shape, device=device) * mult_noise_sd)
+
+        # Additive white noise
         if args["whiteNoiseSD"] > 0:
             X += torch.randn(X.shape, device=device) * args["whiteNoiseSD"]
 
+        # Constant offset per channel (simulates DC drift)
         if args["constantOffsetSD"] > 0:
             X += (
                 torch.randn([X.shape[0], 1, X.shape[2]], device=device)
                 * args["constantOffsetSD"]
             )
 
+        # Random temporal shift (v4): remove 0..N timesteps from start
+        if temporal_shift_max > 0:
+            shift = torch.randint(0, temporal_shift_max + 1, (1,)).item()
+            if shift > 0:
+                X = X[:, shift:, :]
+                X_len = X_len - shift
+                X_len = torch.clamp(X_len, min=1)
+
         # Compute prediction error (with optional AMP)
         inter_log_probs = None
+        char_log_probs = None
         with torch.amp.autocast("cuda", enabled=use_amp):
             if args.get("model_type", "gru_baseline") == "transformer_ctc":
-                log_probs, out_lens, inter_log_probs = model(X, dayIdx, X_len)
+                log_probs, out_lens, inter_log_probs, char_log_probs = model(
+                    X, dayIdx, X_len
+                )
             else:
                 pred = model.forward(X, dayIdx)
                 out_lens = ((X_len - model.kernelLen) / model.strideLen).to(torch.int32)
@@ -248,7 +313,7 @@ def trainModel(args):
             # CTC loss needs float32 log_probs
             log_probs_f32 = log_probs.float()
 
-            # Main CTC loss
+            # Main CTC loss (phoneme)
             loss = loss_ctc(
                 log_probs_f32,
                 y,
@@ -285,11 +350,30 @@ def trainModel(args):
 
             # Combine main loss with intermediate CTC loss
             if inter_log_probs is not None:
-                loss = (
+                phone_loss = (
                     1.0 - interctc_weight
                 ) * main_loss + interctc_weight * inter_loss
             else:
-                loss = main_loss
+                phone_loss = main_loss
+
+            # Character CTC loss (dual-task, v4)
+            total_loss = phone_loss
+            if use_char_ctc and char_log_probs is not None:
+                char_log_probs_f32 = char_log_probs.float()
+                char_loss_raw = loss_char_ctc(
+                    char_log_probs_f32,
+                    char_y,
+                    out_lens,
+                    char_y_len,
+                )
+                char_loss = torch.mean(char_loss_raw)
+                total_loss = (
+                    1.0 - char_ctc_weight
+                ) * phone_loss + char_ctc_weight * char_loss
+            else:
+                char_loss = None
+
+            loss = total_loss
 
         # Backpropagation with AMP scaling
         optimizer.zero_grad()
@@ -325,7 +409,9 @@ def trainModel(args):
             log_dict["train/kl_loss"] = kl_div.item()
         if inter_log_probs is not None:
             log_dict["train/inter_ctc_loss"] = inter_loss.item()
-            log_dict["train/main_loss"] = main_loss.item()
+            log_dict["train/phone_loss"] = phone_loss.item()
+        if char_loss is not None:
+            log_dict["train/char_ctc_loss"] = char_loss.item()
         wandb.log(log_dict, step=batch)
 
         # Eval
@@ -350,8 +436,8 @@ def trainModel(args):
                     )
 
                     if args.get("model_type", "gru_baseline") == "transformer_ctc":
-                        pred, adjustedLens, _ = model(X, testDayIdx, X_len)
-                        # pred is [T, B, C], ignore intermediate output during eval
+                        pred, adjustedLens, _, _ = model(X, testDayIdx, X_len)
+                        # pred is [T, B, C], ignore intermediate/char output during eval
                     else:
                         logits = model.forward(X, testDayIdx)
                         adjustedLens = ((X_len - model.kernelLen) / model.strideLen).to(
@@ -503,10 +589,14 @@ def loadConformerModel(modelDir, nInputLayers=24, device="cuda"):
         drop_path_prob=0.0,  # Disabled during inference
         autoencoder_residual=args.get("autoencoder_residual", False),
         use_rope=args.get("use_rope", False),
+        n_chars=0,  # Char head not needed at inference
         device=device,
     ).to(device)
 
-    model.load_state_dict(torch.load(modelWeightPath, map_location=device))
+    # Load with strict=False to allow missing char_output keys at inference
+    model.load_state_dict(
+        torch.load(modelWeightPath, map_location=device), strict=False
+    )
     return model
 
 
