@@ -165,11 +165,5 @@ logs/
 ptDecoder_ctc
 wandb/
 
-# lm_decoder C++ build artifacts
-language_model/runtime/server/x86/build/
-language_model/runtime/server/x86/fc_base/
-language_model/runtime/server/x86/dist/
-language_model/runtime/server/x86/lm_decoder.egg*
-language_model/runtime/server/x86/lm_decoder.cpython*
-
-language_model/pretrained_language_models
+# Language model directory (downloaded via scripts/setup_lm_dir.py)
+lm_dir/
